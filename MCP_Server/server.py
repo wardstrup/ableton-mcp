@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
 from .telemetry import record_startup
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
@@ -139,7 +139,15 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            # Recording / mixer commands. These return as soon as Live accepts
+            # the call; they do not wait for a take to finish.
+            "set_track_arm", "set_track_mute", "set_track_solo",
+            "set_track_volume", "set_track_panning", "set_track_send",
+            "set_track_monitoring", "set_track_input_routing",
+            "set_arrangement_record", "set_session_record",
+            "set_arrangement_overdub", "record_empty_slot", "stop_recording",
+            "prepare_track", "set_clip_region",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1030,6 +1038,439 @@ def stop_playback(ctx: Context, user_prompt: str = "") -> str:
     except Exception as e:
         logger.error(f"Error stopping playback: {str(e)}")
         return f"Error stopping playback: {str(e)}"
+
+
+# Recording workflow. Values are Live parameter units (volume and sends are
+# typically 0.0–1.0, pan typically -1.0–1.0), not dB. None of these wait for
+# audio to finish recording. Keep MAX_EMPTY_SLOT_RECORD_BEATS in sync with
+# AbletonMCP_Remote_Script.
+_MONITORING_NAMES = {"in", "auto", "off"}
+_STOP_SCOPES = {"arrangement", "session", "slot", "recording"}
+_CLIP_VIEWS = {"session", "arrangement"}
+_MAX_EMPTY_SLOT_RECORD_BEATS = 16384
+
+
+def _omit_none(params: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in params.items() if value is not None}
+
+
+def _recording_call(command: str, params: Optional[Dict[str, Any]] = None) -> str:
+    """Send one recording-workflow command and return JSON or an error string."""
+    from .script_handshake import require_capability
+
+    missing = require_capability(command)
+    if missing:
+        return missing
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command(command, params or {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in {command}: {e}")
+        return f"Error {command}: {e}"
+
+
+def _reject_record_length(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "record_length must be a positive finite number of beats"
+    if (
+        value != value
+        or value <= 0
+        or value == float("inf")
+        or value == float("-inf")
+        or value > _MAX_EMPTY_SLOT_RECORD_BEATS
+    ):
+        return (
+            "record_length must be a positive finite number of beats "
+            f"up to {_MAX_EMPTY_SLOT_RECORD_BEATS}"
+        )
+    return None
+
+
+@mcp.tool()
+@telemetry_tool("get_recording_state")
+@trajectory_tool("get_recording_state", modifying=False)
+def get_recording_state(ctx: Context, user_prompt: str = "") -> str:
+    """Read arrangement record, session record, overdub, count-in, and which slots are recording.
+
+    Count-in is reported and cannot be changed here. This does not start or stop anything.
+    """
+    return _recording_call("get_recording_state", {})
+
+
+@mcp.tool()
+@telemetry_tool("get_track_mixer_state")
+@trajectory_tool("get_track_mixer_state", modifying=False)
+def get_track_mixer_state(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """Read arm, mute, solo, volume, pan, sends, monitoring, and input routing for one track.
+
+    Includes the input routing names Live currently offers, so a later
+    set_track_input_routing or prepare_track can use one of those strings.
+    """
+    return _recording_call("get_track_mixer_state", {"track_index": track_index})
+
+
+@mcp.tool()
+@telemetry_tool("set_track_arm")
+@trajectory_tool("set_track_arm")
+def set_track_arm(ctx: Context, track_index: int, armed: bool, user_prompt: str = "") -> str:
+    """Set a track's arm button explicitly. This is not a toggle.
+
+    Group, return, and main tracks cannot be armed. When Live's exclusive-arm
+    preference is on, arming one track disarms the others; that preference is not changed.
+    """
+    return _recording_call(
+        "set_track_arm", {"track_index": track_index, "armed": armed}
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_track_mute")
+@trajectory_tool("set_track_mute")
+def set_track_mute(ctx: Context, track_index: int, mute: bool, user_prompt: str = "") -> str:
+    """Set a track's mute button explicitly. This is not a toggle."""
+    return _recording_call("set_track_mute", {"track_index": track_index, "mute": mute})
+
+
+@mcp.tool()
+@telemetry_tool("set_track_solo")
+@trajectory_tool("set_track_solo")
+def set_track_solo(ctx: Context, track_index: int, solo: bool, user_prompt: str = "") -> str:
+    """Set a track's solo button explicitly. This is not a toggle.
+
+    Live does not apply exclusive-solo when solo is set from the API, so other
+    solos are left as they are.
+    """
+    return _recording_call("set_track_solo", {"track_index": track_index, "solo": solo})
+
+
+@mcp.tool()
+@telemetry_tool("set_track_volume")
+@trajectory_tool("set_track_volume")
+def set_track_volume(ctx: Context, track_index: int, value: float, user_prompt: str = "") -> str:
+    """Set mixer volume in Live's raw parameter units (usually 0.0 to 1.0, not dB).
+
+    Values outside the parameter's own min/max are rejected and the volume is left unchanged.
+    """
+    return _recording_call(
+        "set_track_volume", {"track_index": track_index, "value": value}
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_track_panning")
+@trajectory_tool("set_track_panning")
+def set_track_panning(ctx: Context, track_index: int, value: float, user_prompt: str = "") -> str:
+    """Set mixer pan in Live's raw parameter units (usually -1.0 left to 1.0 right)."""
+    return _recording_call(
+        "set_track_panning", {"track_index": track_index, "value": value}
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_track_send")
+@trajectory_tool("set_track_send")
+def set_track_send(
+    ctx: Context,
+    track_index: int,
+    send_index: int,
+    value: float,
+    user_prompt: str = "",
+) -> str:
+    """Set one send in Live's raw parameter units (usually 0.0 to 1.0).
+
+    send_index is the position in the track's send list. An out-of-range index does not change any send.
+    """
+    return _recording_call(
+        "set_track_send",
+        {"track_index": track_index, "send_index": send_index, "value": value},
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_track_monitoring")
+@trajectory_tool("set_track_monitoring")
+def set_track_monitoring(
+    ctx: Context, track_index: int, monitoring: str, user_prompt: str = ""
+) -> str:
+    """Set input monitoring to in, auto, or off.
+
+    Live stores this as 0=in, 1=auto, 2=off. The response includes that integer.
+    """
+    if not isinstance(monitoring, str) or monitoring.strip().lower() not in _MONITORING_NAMES:
+        return "Error set_track_monitoring: monitoring must be one of in, auto, off"
+    return _recording_call(
+        "set_track_monitoring",
+        {"track_index": track_index, "monitoring": monitoring.strip().lower()},
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_track_input_routing")
+@trajectory_tool("set_track_input_routing")
+def set_track_input_routing(
+    ctx: Context,
+    track_index: int,
+    input_routing_type: str = "",
+    input_routing_channel: str = "",
+    user_prompt: str = "",
+) -> str:
+    """Set input routing by the display names Live reports for this track.
+
+    Pass either or both. Names must match get_track_mixer_state's available
+    lists (exact match, or a unique case-insensitive match). Output routing is
+    not changed. A channel that is not valid for the new type leaves the previous type in place.
+    """
+    params: Dict[str, Any] = {"track_index": track_index}
+    if input_routing_type:
+        params["input_routing_type"] = input_routing_type
+    if input_routing_channel:
+        params["input_routing_channel"] = input_routing_channel
+    if len(params) == 1:
+        return (
+            "Error set_track_input_routing: input_routing_type or "
+            "input_routing_channel is required"
+        )
+    return _recording_call("set_track_input_routing", params)
+
+
+@mcp.tool()
+@telemetry_tool("set_arrangement_record")
+@trajectory_tool("set_arrangement_record")
+def set_arrangement_record(
+    ctx: Context,
+    enabled: bool,
+    allow_overwrite: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """Set the arrangement record button explicitly. This does not start or stop playback.
+
+    Enabling is refused when an armed track has an arrangement clip under the
+    playhead, unless allow_overwrite is true. Turning it off keeps the recorded
+    arrangement audio and does not delete anything.
+    """
+    return _recording_call(
+        "set_arrangement_record",
+        {"enabled": enabled, "allow_overwrite": allow_overwrite},
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_session_record")
+@trajectory_tool("set_session_record")
+def set_session_record(
+    ctx: Context,
+    enabled: bool,
+    allow_overwrite: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """Set the session record button explicitly. This is not Song.trigger_session_record.
+
+    Enabling records into the selected scene on every armed track and can
+    overdub a clip that is already playing. That is refused unless
+    allow_overwrite is true. To record one empty slot, use record_empty_slot
+    instead. Turning this off does not delete clips and does not stop playback.
+    """
+    return _recording_call(
+        "set_session_record",
+        {"enabled": enabled, "allow_overwrite": allow_overwrite},
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_arrangement_overdub")
+@trajectory_tool("set_arrangement_overdub")
+def set_arrangement_overdub(
+    ctx: Context, enabled: bool, user_prompt: str = ""
+) -> str:
+    """Set MIDI arrangement overdub explicitly. This does not start recording.
+
+    Song.overdub is a legacy alias of session record and is not set by this tool.
+    """
+    return _recording_call("set_arrangement_overdub", {"enabled": enabled})
+
+
+@mcp.tool()
+@telemetry_tool("record_empty_slot")
+@trajectory_tool("record_empty_slot")
+def record_empty_slot(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    arm: bool = True,
+    record_length: Optional[float] = None,
+    user_prompt: str = "",
+) -> str:
+    """Record into one empty Session slot by arming that track, if requested, and firing the slot.
+
+    Refuses when the slot already has a clip or is recording. Does not turn on
+    the global session record button, so other tracks are not punched in by
+    this call. Omit record_length to keep recording until stop_recording.
+    Pass record_length in beats for a fixed length; Live then ends the take
+    itself. The response means the slot was fired, not that audio has arrived.
+    Launch quantization can delay the punch. Count-in is not changed.
+    """
+    length_error = _reject_record_length(record_length)
+    if length_error:
+        return f"Error record_empty_slot: {length_error}"
+    params: Dict[str, Any] = {
+        "track_index": track_index,
+        "clip_index": clip_index,
+        "arm": arm,
+    }
+    if record_length is not None:
+        params["record_length"] = record_length
+    return _recording_call("record_empty_slot", params)
+
+
+@mcp.tool()
+@telemetry_tool("stop_recording")
+@trajectory_tool("stop_recording")
+def stop_recording(
+    ctx: Context,
+    scope: str,
+    track_index: Optional[int] = None,
+    clip_index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """Stop recording without deleting clips and without stopping the transport.
+
+    scope:
+    - arrangement: arrangement record button off. Playback continues.
+    - session: session record button off. Playback continues.
+    - slot: stop session clips on that track only when that slot is recording.
+      Requires track_index and clip_index. A slot that is merely playing is left playing.
+    - recording: both record buttons off, and session clips stopped only on
+      tracks that are actually recording.
+    """
+    if not isinstance(scope, str) or scope not in _STOP_SCOPES:
+        return (
+            "Error stop_recording: scope must be one of "
+            "arrangement, session, slot, recording"
+        )
+    params: Dict[str, Any] = {"scope": scope}
+    if scope == "slot":
+        if track_index is None or clip_index is None:
+            return "Error stop_recording: slot scope requires track_index and clip_index"
+        params["track_index"] = track_index
+        params["clip_index"] = clip_index
+    elif track_index is not None or clip_index is not None:
+        return "Error stop_recording: track_index and clip_index are only valid when scope is slot"
+    return _recording_call("stop_recording", params)
+
+
+@mcp.tool()
+@telemetry_tool("prepare_track")
+@trajectory_tool("prepare_track")
+def prepare_track(
+    ctx: Context,
+    track_index: int,
+    name: Optional[str] = None,
+    arm: Optional[bool] = None,
+    mute: Optional[bool] = None,
+    solo: Optional[bool] = None,
+    volume: Optional[float] = None,
+    panning: Optional[float] = None,
+    sends: Optional[List[Dict[str, float]]] = None,
+    monitoring: Optional[str] = None,
+    input_routing_type: Optional[str] = None,
+    input_routing_channel: Optional[str] = None,
+    user_prompt: str = "",
+) -> str:
+    """Set any mix of name, arm, mute, solo, volume, pan, sends, monitoring, and input routing in one call.
+
+    Omitted arguments are left unchanged. Invalid values are rejected before Live is changed.
+    This does not start recording. sends is a list of {"index": int, "value": float}.
+    monitoring is in, auto, or off. Volume, pan, and sends use Live parameter units.
+    """
+    if monitoring is not None and (
+        not isinstance(monitoring, str) or monitoring.strip().lower() not in _MONITORING_NAMES
+    ):
+        return "Error prepare_track: monitoring must be one of in, auto, off"
+    params = _omit_none({
+        "track_index": track_index,
+        "name": name,
+        "arm": arm,
+        "mute": mute,
+        "solo": solo,
+        "volume": volume,
+        "panning": panning,
+        "sends": sends,
+        "monitoring": None if monitoring is None else monitoring.strip().lower(),
+        "input_routing_type": input_routing_type,
+        "input_routing_channel": input_routing_channel,
+    })
+    return _recording_call("prepare_track", params)
+
+
+@mcp.tool()
+@telemetry_tool("get_clip_region")
+@trajectory_tool("get_clip_region", modifying=False)
+def get_clip_region(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    view: str = "session",
+    user_prompt: str = "",
+) -> str:
+    """Read a clip's start marker, end marker, loop, and whether it is recording.
+
+    view is session or arrangement. Markers are beats for MIDI and warped audio,
+    and seconds for unwarped audio. This does not crop the clip or read the sample out.
+    """
+    if view not in _CLIP_VIEWS:
+        return "Error get_clip_region: view must be session or arrangement"
+    return _recording_call(
+        "get_clip_region",
+        {"track_index": track_index, "clip_index": clip_index, "view": view},
+    )
+
+
+@mcp.tool()
+@telemetry_tool("set_clip_region")
+@trajectory_tool("set_clip_region")
+def set_clip_region(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    view: str = "session",
+    start_marker: Optional[float] = None,
+    end_marker: Optional[float] = None,
+    loop_start: Optional[float] = None,
+    loop_end: Optional[float] = None,
+    looping: Optional[bool] = None,
+    user_prompt: str = "",
+) -> str:
+    """Move a clip's start/end markers or loop. This does not crop or replace the source file.
+
+    end_marker must stay greater than start_marker, and the loop must stay inside
+    those markers. Unwarped audio cannot be set to looping. A clip that is currently
+    recording is left unchanged. view is session or arrangement.
+    """
+    if view not in _CLIP_VIEWS:
+        return "Error set_clip_region: view must be session or arrangement"
+    params = _omit_none({
+        "track_index": track_index,
+        "clip_index": clip_index,
+        "view": view,
+        "start_marker": start_marker,
+        "end_marker": end_marker,
+        "loop_start": loop_start,
+        "loop_end": loop_end,
+        "looping": looping,
+    })
+    if not any(
+        key in params
+        for key in ("start_marker", "end_marker", "loop_start", "loop_end", "looping")
+    ):
+        return (
+            "Error set_clip_region: set at least one of start_marker, end_marker, "
+            "loop_start, loop_end, looping"
+        )
+    return _recording_call("set_clip_region", params)
+
 
 @mcp.tool()
 @rich_telemetry_tool("get_browser_tree")

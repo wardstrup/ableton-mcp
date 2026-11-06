@@ -34,8 +34,54 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
+
+# Live 12 Python API (not the older Max LOM wording):
+#   Song.record_mode            arrangement record button, get/set
+#   Song.session_record         session record state, get/set
+#   Song.session_record_status  off=0, on=1, transition=2, get only
+#   Song.arrangement_overdub    arrangement overdub, get/set
+#   Song.overdub                legacy alias of session record; not set here
+#   Song.count_in_duration      get/observe only (0 none, 1 one bar, 2 two, 3 four)
+#   Song.trigger_session_record is a toggle (a second call stops and plays).
+#     Empty-slot recording uses ClipSlot.fire instead, which takes an explicit slot.
+#   ClipSlot.fire(record_length) records that empty slot for record_length beats
+#     and raises if the slot already owns a clip.
+#   Track.current_monitoring_state  0=in, 1=auto, 2=off
+# Clip.crop and audio-file replacement are intentionally not exposed.
+
+# Open-ended fire() is ClipSlot.fire with no args. A passed length is beats.
+MAX_EMPTY_SLOT_RECORD_BEATS = 16384
+
+_MONITORING_STATE_BY_NAME = {"in": 0, "auto": 1, "off": 2}
+_MONITORING_NAME_BY_STATE = {0: "in", 1: "auto", 2: "off"}
+_COUNT_IN_LABELS = {0: "none", 1: "1_bar", 2: "2_bars", 3: "4_bars"}
+_SESSION_RECORD_STATUS_NAMES = {0: "off", 1: "on", 2: "transition"}
+_STOP_RECORDING_SCOPES = ("arrangement", "session", "slot", "recording")
+_CLIP_REGION_VIEWS = ("session", "arrangement")
+
+# New commands. Every one runs on Live's main thread via schedule_message.
+RECORDING_COMMANDS = (
+    "get_recording_state",
+    "get_track_mixer_state",
+    "set_track_arm",
+    "set_track_mute",
+    "set_track_solo",
+    "set_track_volume",
+    "set_track_panning",
+    "set_track_send",
+    "set_track_monitoring",
+    "set_track_input_routing",
+    "set_arrangement_record",
+    "set_session_record",
+    "set_arrangement_overdub",
+    "record_empty_slot",
+    "stop_recording",
+    "prepare_track",
+    "get_clip_region",
+    "set_clip_region",
+)
 
 SCRIPT_CAPABILITIES = [
     "get_session_info",
@@ -57,7 +103,7 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
-]
+] + list(RECORDING_COMMANDS)
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -279,6 +325,10 @@ class AbletonMCP(ControlSurface):
         }
         
         try:
+            # Recording / mixer / routing / clip-region commands always run on
+            # Live's main thread. Invalid params fail before any Live write.
+            if command_type in RECORDING_COMMANDS:
+                return self._dispatch_recording_command(command_type, params)
             # Route the command to the appropriate handler
             if command_type == "get_script_info":
                 response["result"] = self._get_script_info()
@@ -524,6 +574,19 @@ class AbletonMCP(ControlSurface):
             "capabilities": list(SCRIPT_CAPABILITIES),
             "snapshot_schema": "ableton_mcp_snapshot_v2",
             "passive_listeners": True,
+            "recording": {
+                "commands": list(RECORDING_COMMANDS),
+                "count_in_writable": False,
+                "count_in_duration_labels": dict(
+                    (str(k), v) for k, v in _COUNT_IN_LABELS.items()
+                ),
+                "monitoring_states": dict(_MONITORING_STATE_BY_NAME),
+                "fixed_length_empty_slot": True,
+                "uses_trigger_session_record": False,
+                "crop": False,
+                "replaces_source_files": False,
+                "realtime": False,
+            },
         }
     
     def _safe_song_property(self, attr, cast, default):
@@ -556,6 +619,21 @@ class AbletonMCP(ControlSurface):
                 "loop":              self._safe_song_property("loop",              bool,  False),
                 "loop_start":        self._safe_song_property("loop_start",        float, 0.0),
                 "loop_length":       self._safe_song_property("loop_length",       float, 0.0),
+                # Additive recording flags. A missing or unreadable attribute
+                # stays at the default so this existing command still returns.
+                # Richer state, read on the main thread, is get_recording_state.
+                "record_mode": self._optional_song_value("record_mode", bool, False),
+                "session_record": self._optional_song_value("session_record", bool, False),
+                "arrangement_overdub": self._optional_song_value(
+                    "arrangement_overdub", bool, False
+                ),
+                "session_record_status": self._optional_song_value(
+                    "session_record_status", int, None
+                ),
+                "is_counting_in": self._optional_song_value("is_counting_in", bool, False),
+                "count_in_duration": self._optional_song_value(
+                    "count_in_duration", int, None
+                ),
             }
             return result
         except Exception as e:
@@ -580,7 +658,11 @@ class AbletonMCP(ControlSurface):
                         "name": clip.name,
                         "length": clip.length,
                         "is_playing": clip.is_playing,
-                        "is_recording": clip.is_recording
+                        "is_recording": clip.is_recording,
+                        # Playback region. Setting these is set_clip_region;
+                        # this read does not crop or touch the source file.
+                        "start_marker": self._safe_attr(clip, "start_marker", float, None),
+                        "end_marker": self._safe_attr(clip, "end_marker", float, None),
                     }
                 
                 clip_slots.append({
@@ -1021,7 +1103,12 @@ class AbletonMCP(ControlSurface):
                     "color": clip.color,
                     "is_midi_clip": clip.is_midi_clip,
                     "is_audio_clip": clip.is_audio_clip,
-                    "is_playing": clip.is_playing
+                    "is_playing": clip.is_playing,
+                    "start_marker": self._safe_attr(clip, "start_marker", float, None),
+                    "end_marker": self._safe_attr(clip, "end_marker", float, None),
+                    "loop_start": self._safe_attr(clip, "loop_start", float, None),
+                    "loop_end": self._safe_attr(clip, "loop_end", float, None),
+                    "looping": self._safe_attr(clip, "looping", bool, None),
                 })
 
             return {
@@ -2042,6 +2129,8 @@ class AbletonMCP(ControlSurface):
             "looping": bool(self._safe_attr(clip, "looping", bool, False)),
             "loop_start": self._safe_attr(clip, "loop_start", float, None),
             "loop_end": self._safe_attr(clip, "loop_end", float, None),
+            "start_marker": self._safe_attr(clip, "start_marker", float, None),
+            "end_marker": self._safe_attr(clip, "end_marker", float, None),
             "warping": bool(self._safe_attr(clip, "warping", bool, False)),
             "warp_mode": self._safe_attr(clip, "warp_mode", int, None),
             "gain": self._safe_attr(clip, "gain", float, None),
@@ -2587,3 +2676,1545 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting browser items at path: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
             raise
+
+    # ── Recording, mixer, routing, clip region ────────────────────────────────
+    # These commands are scheduled onto Live's main thread. Validation finishes
+    # before the first Live write. Nothing here calls Clip.crop, deletes a
+    # clip, replaces an audio file, or sleeps until a take finishes.
+
+    def _run_on_main_thread(self, task, timeout=10.0):
+        """Run task on Live's main thread and return a response dict."""
+        response_queue = queue.Queue()
+
+        def main_thread_task():
+            try:
+                response_queue.put({"status": "success", "result": task()})
+            except Exception as e:
+                self.log_message("Error in main thread task: " + str(e))
+                self.log_message(traceback.format_exc())
+                response_queue.put({"status": "error", "message": str(e)})
+
+        try:
+            self.schedule_message(0, main_thread_task)
+        except AssertionError:
+            # schedule_message refuses the call when we are already on the
+            # main thread. Run the task directly in that case.
+            main_thread_task()
+
+        try:
+            return response_queue.get(timeout=timeout)
+        except queue.Empty:
+            return {
+                "status": "error",
+                "message": "Timeout waiting for operation to complete",
+            }
+
+    def _recording_handlers(self):
+        return {
+            "get_recording_state": self._cmd_get_recording_state,
+            "get_track_mixer_state": self._cmd_get_track_mixer_state,
+            "set_track_arm": self._cmd_set_track_arm,
+            "set_track_mute": self._cmd_set_track_mute,
+            "set_track_solo": self._cmd_set_track_solo,
+            "set_track_volume": self._cmd_set_track_volume,
+            "set_track_panning": self._cmd_set_track_panning,
+            "set_track_send": self._cmd_set_track_send,
+            "set_track_monitoring": self._cmd_set_track_monitoring,
+            "set_track_input_routing": self._cmd_set_track_input_routing,
+            "set_arrangement_record": self._cmd_set_arrangement_record,
+            "set_session_record": self._cmd_set_session_record,
+            "set_arrangement_overdub": self._cmd_set_arrangement_overdub,
+            "record_empty_slot": self._cmd_record_empty_slot,
+            "stop_recording": self._cmd_stop_recording,
+            "prepare_track": self._cmd_prepare_track,
+            "get_clip_region": self._cmd_get_clip_region,
+            "set_clip_region": self._cmd_set_clip_region,
+        }
+
+    def _dispatch_recording_command(self, command_type, params):
+        if not isinstance(params, dict):
+            return {"status": "error", "message": "params must be an object"}
+        handler = self._recording_handlers().get(command_type)
+        if handler is None:
+            return {
+                "status": "error",
+                "message": "Unknown command: " + str(command_type),
+            }
+        return self._run_on_main_thread(lambda: handler(params))
+
+    def _reject_unknown(self, params, allowed):
+        unknown = [key for key in params.keys() if key not in allowed]
+        if unknown:
+            raise ValueError(
+                "Unknown fields: %s. Allowed: %s"
+                % (", ".join(sorted(str(k) for k in unknown)), ", ".join(sorted(allowed)))
+            )
+
+    def _require_present_int(self, params, name):
+        if name not in params:
+            raise ValueError("%s is required" % name)
+        return self._require_int(params[name], name)
+
+    def _require_int(self, value, name):
+        # bool is a subclass of int; reject it so true is not treated as 1.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("%s must be an integer" % name)
+        return value
+
+    def _require_bool(self, value, name):
+        if not isinstance(value, bool):
+            raise ValueError("%s must be a boolean" % name)
+        return value
+
+    def _require_present_bool(self, params, name):
+        if name not in params:
+            raise ValueError("%s is required" % name)
+        return self._require_bool(params[name], name)
+
+    def _finite_float(self, value, name):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("%s must be a finite number" % name)
+        value = float(value)
+        if value != value or value == float("inf") or value == float("-inf"):
+            raise ValueError("%s must be a finite number" % name)
+        return value
+
+    def _require_record_length(self, value):
+        length = self._finite_float(value, "record_length")
+        if length <= 0 or length > MAX_EMPTY_SLOT_RECORD_BEATS:
+            raise ValueError(
+                "record_length must be a positive number of beats up to %d"
+                % MAX_EMPTY_SLOT_RECORD_BEATS
+            )
+        return length
+
+    def _fold_text(self, text):
+        try:
+            return text.casefold()
+        except AttributeError:
+            return text.lower()
+
+    def _optional_song_value(self, attr, cast, default):
+        """Read a song attribute. Any failure returns default and does not raise."""
+        try:
+            value = getattr(self._song, attr)
+        except Exception:
+            return default
+        try:
+            if cast is int and isinstance(value, bool):
+                return default
+            return cast(value)
+        except Exception:
+            return default
+
+    def _read_song_bool(self, attr):
+        return self._optional_song_value(attr, bool, False)
+
+    def _track_at(self, track_index):
+        try:
+            tracks = list(self._song.tracks)
+        except Exception as e:
+            raise ValueError("Could not read song tracks: %s" % e)
+        if track_index < 0 or track_index >= len(tracks):
+            raise IndexError("Track index out of range")
+        return tracks[track_index]
+
+    def _slot_at(self, track, clip_index):
+        try:
+            slots = list(track.clip_slots)
+        except Exception as e:
+            raise ValueError("Could not read clip slots: %s" % e)
+        if clip_index < 0 or clip_index >= len(slots):
+            raise IndexError("Clip index out of range")
+        return slots[clip_index]
+
+    def _is_frozen(self, track):
+        try:
+            return bool(getattr(track, "is_frozen", False))
+        except Exception:
+            return False
+
+    def _is_group_track(self, track):
+        try:
+            return bool(getattr(track, "is_foldable", False))
+        except Exception:
+            return False
+
+    def _can_be_armed(self, track):
+        try:
+            return bool(getattr(track, "can_be_armed", False))
+        except Exception:
+            return False
+
+    def _assert_can_arm(self, track):
+        if self._is_frozen(track):
+            raise ValueError("Track is frozen; arm was not changed")
+        if not self._can_be_armed(track):
+            raise ValueError(
+                "Track cannot be armed. Group, return, and main tracks have "
+                "no arm state. Arm was not changed."
+            )
+
+    def _mixer(self, track):
+        try:
+            mixer = track.mixer_device
+        except Exception as e:
+            raise ValueError("Track has no mixer device (%s)" % e)
+        if mixer is None:
+            raise ValueError("Track has no mixer device")
+        return mixer
+
+    def _assign_bool_attr(self, obj, attr, value):
+        current = bool(getattr(obj, attr))
+        if current == value:
+            return current, False
+        setattr(obj, attr, value)
+        return bool(getattr(obj, attr)), True
+
+    def _assign_song_bool(self, attr, value):
+        try:
+            current = getattr(self._song, attr)
+        except AttributeError:
+            raise ValueError("%s is not available on this Live song" % attr)
+        if bool(current) == value:
+            return bool(current), False
+        setattr(self._song, attr, value)
+        return bool(getattr(self._song, attr)), True
+
+    def _assign_param(self, param, value, label):
+        value = self._finite_float(value, label)
+        try:
+            lo = float(param.min)
+            hi = float(param.max)
+            current = float(param.value)
+        except Exception as e:
+            raise ValueError("%s could not be read (%s); value was not set" % (label, e))
+        if value < lo or value > hi:
+            raise ValueError("%s must be between %s and %s" % (label, lo, hi))
+        if current == value:
+            return current, False
+        param.value = value
+        try:
+            readback = float(param.value)
+        except Exception:
+            readback = value
+        return readback, True
+
+    def _monitoring_value(self, name):
+        if not isinstance(name, str):
+            raise ValueError("monitoring must be one of: in, auto, off")
+        key = self._fold_text(name.strip())
+        if key not in _MONITORING_STATE_BY_NAME:
+            raise ValueError("monitoring must be one of: in, auto, off")
+        return _MONITORING_STATE_BY_NAME[key]
+
+    def _read_monitoring(self, track):
+        try:
+            raw = getattr(track, "current_monitoring_state")
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return None
+            return int(raw)
+        except Exception:
+            return None
+
+    def _require_monitoring(self, track):
+        current = self._read_monitoring(track)
+        if current is None:
+            raise ValueError("Track has no monitoring state; monitoring was not changed")
+        return current
+
+    def _routing_name(self, routing):
+        if isinstance(routing, str):
+            return routing
+        name = None
+        try:
+            name = getattr(routing, "display_name", None)
+        except Exception:
+            name = None
+        if name is None and isinstance(routing, dict):
+            name = routing.get("display_name")
+        if not isinstance(name, str) or name == "":
+            raise ValueError("Routing option has no display_name")
+        return name
+
+    def _routing_options(self, track, attr, label):
+        try:
+            raw = getattr(track, attr)
+            options = list(raw)
+        except Exception as e:
+            raise ValueError("Track has no %s (%s)" % (label, e))
+        return options
+
+    def _routing_names(self, options):
+        names = []
+        for option in options:
+            try:
+                names.append(self._routing_name(option))
+            except ValueError:
+                names.append("?")
+        return names
+
+    def _match_routing(self, options, wanted, label):
+        if not isinstance(wanted, str) or wanted.strip() == "":
+            raise ValueError("%s must be a non-empty string" % label)
+        names = self._routing_names(options)
+        exact = []
+        folded = []
+        wanted_fold = self._fold_text(wanted)
+        for option, name in zip(options, names):
+            if name == "?":
+                continue
+            if name == wanted:
+                exact.append(option)
+            elif self._fold_text(name) == wanted_fold:
+                folded.append(option)
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise ValueError("%s %r matches more than one routing" % (label, wanted))
+        if len(folded) == 1:
+            return folded[0]
+        shown = ", ".join(names) if names else "(none)"
+        if len(folded) > 1:
+            raise ValueError("%s %r is ambiguous. Options: %s" % (label, wanted, shown))
+        raise ValueError("%s %r is not available. Options: %s" % (label, wanted, shown))
+
+    def _assign_input_routing(self, track, routing_type, routing_channel, channel_name):
+        """Set input type, then channel. A failed channel match restores the type."""
+        previous_type = None
+        type_written = False
+        wrote = False
+        try:
+            if routing_type is not None:
+                current_name = self._routing_name(track.input_routing_type)
+                if current_name != self._routing_name(routing_type):
+                    previous_type = track.input_routing_type
+                    track.input_routing_type = routing_type
+                    type_written = True
+                    wrote = True
+            if routing_channel is None and channel_name is not None:
+                channels = self._routing_options(
+                    track, "available_input_routing_channels", "input routing channels"
+                )
+                routing_channel = self._match_routing(
+                    channels, channel_name, "input routing channel"
+                )
+            if routing_channel is not None:
+                current_channel = self._routing_name(track.input_routing_channel)
+                if current_channel != self._routing_name(routing_channel):
+                    track.input_routing_channel = routing_channel
+                    wrote = True
+        except Exception:
+            if type_written and previous_type is not None:
+                try:
+                    track.input_routing_type = previous_type
+                except Exception as restore_error:
+                    self.log_message(
+                        "input routing restore failed: " + str(restore_error)
+                    )
+            raise
+        return wrote
+
+    def _selected_scene_index(self):
+        try:
+            selected = self._song.view.selected_scene
+            scenes = list(self._song.scenes)
+        except Exception:
+            return None
+        for index, scene in enumerate(scenes):
+            if scene is selected:
+                return index
+        for index, scene in enumerate(scenes):
+            if scene == selected:
+                return index
+        return None
+
+    def _playing_slot_index(self, track):
+        try:
+            value = getattr(track, "playing_slot_index")
+        except Exception:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    def _slot_or_none(self, track, clip_index):
+        try:
+            slots = list(track.clip_slots)
+        except Exception:
+            return None
+        if clip_index < 0 or clip_index >= len(slots):
+            return None
+        return slots[clip_index]
+
+    def _slot_is_recording(self, slot):
+        try:
+            if bool(getattr(slot, "is_recording", False)):
+                return True
+        except Exception:
+            pass
+        try:
+            if getattr(slot, "has_clip", False) and bool(slot.clip.is_recording):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _recording_slot_indexes(self, track):
+        found = []
+        try:
+            slots = list(track.clip_slots)
+        except Exception:
+            return found
+        for index, slot in enumerate(slots):
+            if self._slot_is_recording(slot):
+                found.append(index)
+        return found
+
+    def _iter_tracks(self):
+        try:
+            return list(self._song.tracks)
+        except Exception:
+            return []
+
+    def _session_record_blockers(self):
+        """Clips session record would write into. Reads only."""
+        scene_index = self._selected_scene_index()
+        conflicts = []
+        armed = []
+        for track_index, track in enumerate(self._iter_tracks()):
+            if not self._safe_arm(track):
+                continue
+            armed.append(track_index)
+            playing = self._playing_slot_index(track)
+            reported = set()
+            if playing is not None and playing >= 0:
+                slot = self._slot_or_none(track, playing)
+                if slot is not None and bool(getattr(slot, "has_clip", False)):
+                    conflicts.append({
+                        "track_index": track_index,
+                        "clip_index": playing,
+                        "reason": "playing_clip",
+                    })
+                    reported.add(playing)
+            if scene_index is not None and scene_index not in reported:
+                slot = self._slot_or_none(track, scene_index)
+                if slot is not None and bool(getattr(slot, "has_clip", False)):
+                    conflicts.append({
+                        "track_index": track_index,
+                        "clip_index": scene_index,
+                        "reason": "selected_scene_clip",
+                    })
+        return scene_index, armed, conflicts
+
+    def _arrangement_record_blockers(self):
+        """Arrangement clips covering the playhead on armed tracks. Reads only."""
+        try:
+            song_time = float(self._song.current_song_time)
+        except Exception:
+            return None, [], ["song_time"]
+        conflicts = []
+        unverified = []
+        for track_index, track in enumerate(self._iter_tracks()):
+            if not self._safe_arm(track):
+                continue
+            try:
+                clips = list(track.arrangement_clips)
+            except Exception:
+                unverified.append(track_index)
+                continue
+            track_unverified = False
+            for clip_index, clip in enumerate(clips):
+                try:
+                    start = float(clip.start_time)
+                    end = float(clip.end_time)
+                except Exception:
+                    track_unverified = True
+                    break
+                if start <= song_time < end:
+                    conflicts.append({
+                        "track_index": track_index,
+                        "clip_index": clip_index,
+                        "start_time": start,
+                        "end_time": end,
+                        "song_time": song_time,
+                    })
+            if track_unverified:
+                unverified.append(track_index)
+        return song_time, conflicts, unverified
+
+    def _format_slot_conflicts(self, conflicts):
+        return "; ".join(
+            "track %s slot %s (%s)" % (
+                item.get("track_index"), item.get("clip_index"), item.get("reason")
+            )
+            for item in conflicts
+        )
+
+    def _song_transport_snapshot(self):
+        status_value = self._optional_song_value("session_record_status", int, None)
+        count_in = self._optional_song_value("count_in_duration", int, None)
+        return {
+            "is_playing": self._optional_song_value("is_playing", bool, None),
+            "current_song_time": self._optional_song_value("current_song_time", float, None),
+            "record_mode": self._optional_song_value("record_mode", bool, None),
+            "session_record": self._optional_song_value("session_record", bool, None),
+            "session_record_status": (
+                _SESSION_RECORD_STATUS_NAMES.get(status_value, "unknown")
+                if status_value is not None else None
+            ),
+            "session_record_status_value": status_value,
+            "arrangement_overdub": self._optional_song_value(
+                "arrangement_overdub", bool, None
+            ),
+            "legacy_overdub": self._optional_song_value("overdub", bool, None),
+            "metronome": self._optional_song_value("metronome", bool, None),
+            "is_counting_in": self._optional_song_value("is_counting_in", bool, None),
+            "count_in_duration": count_in,
+            "count_in_label": (
+                _COUNT_IN_LABELS.get(count_in, "unknown") if count_in is not None else None
+            ),
+            "exclusive_arm": self._optional_song_value("exclusive_arm", bool, None),
+            "selected_scene_index": self._selected_scene_index(),
+        }
+
+    def _cmd_get_recording_state(self, params):
+        self._reject_unknown(params, ())
+        state = self._song_transport_snapshot()
+        tracks = []
+        recording_slots = []
+        for track_index, track in enumerate(self._iter_tracks()):
+            slots = self._recording_slot_indexes(track)
+            for clip_index in slots:
+                recording_slots.append({
+                    "track_index": track_index,
+                    "clip_index": clip_index,
+                })
+            tracks.append({
+                "index": track_index,
+                "name": getattr(track, "name", ""),
+                "can_be_armed": self._can_be_armed(track),
+                "arm": self._safe_arm(track),
+                "is_frozen": self._is_frozen(track),
+                "is_group_track": self._is_group_track(track),
+                "playing_slot_index": self._playing_slot_index(track),
+                "recording_slots": slots,
+            })
+        state["tracks"] = tracks
+        state["recording_slots"] = recording_slots
+        state["armed_tracks"] = [
+            item["index"] for item in tracks if item["arm"]
+        ]
+        state["limitations"] = {
+            "count_in_writable": False,
+            "crop_implemented": False,
+            "replaces_source_files": False,
+            "uses_trigger_session_record": False,
+            "fixed_length": (
+                "record_empty_slot accepts record_length in beats and calls "
+                "ClipSlot.fire(record_length) on that empty slot only. "
+                "Song.trigger_session_record is not used: it targets an "
+                "implicit slot and a second call stops recording and starts "
+                "playback. Count-in is reported and not changed."
+            ),
+            "realtime": False,
+        }
+        state["legacy_overdub_note"] = (
+            "Song.overdub is a legacy alias of session record in the Live 12 "
+            "Python API. This script reads it and does not set it. "
+            "Arrangement overdub is arrangement_overdub."
+        )
+        return state
+
+    def _param_state(self, param):
+        try:
+            return {
+                "value": float(param.value),
+                "min": float(param.min),
+                "max": float(param.max),
+                "name": str(getattr(param, "name", "")),
+            }
+        except Exception:
+            return None
+
+    def _routing_state(self, track, current_attr, available_attr):
+        current = None
+        try:
+            current = self._routing_name(getattr(track, current_attr))
+        except Exception:
+            current = None
+        options = []
+        try:
+            options = self._routing_names(
+                self._routing_options(track, available_attr, available_attr)
+            )
+        except Exception:
+            options = []
+        return current, options
+
+    def _mixer_state(self, track_index, track):
+        mixer = None
+        volume = None
+        panning = None
+        sends = []
+        try:
+            mixer = track.mixer_device
+            volume = self._param_state(mixer.volume)
+            panning = self._param_state(mixer.panning)
+            for index, send in enumerate(list(mixer.sends)):
+                item = self._param_state(send)
+                if item is not None:
+                    item["index"] = index
+                    sends.append(item)
+        except Exception:
+            pass
+        monitoring = self._read_monitoring(track)
+        input_type, input_types = self._routing_state(
+            track, "input_routing_type", "available_input_routing_types"
+        )
+        input_channel, input_channels = self._routing_state(
+            track, "input_routing_channel", "available_input_routing_channels"
+        )
+        output_type, _output_types = self._routing_state(
+            track, "output_routing_type", "available_output_routing_types"
+        )
+        output_channel, _output_channels = self._routing_state(
+            track, "output_routing_channel", "available_output_routing_channels"
+        )
+        return {
+            "track_index": track_index,
+            "name": getattr(track, "name", ""),
+            "has_audio_input": bool(getattr(track, "has_audio_input", False)),
+            "has_midi_input": bool(getattr(track, "has_midi_input", False)),
+            "can_be_armed": self._can_be_armed(track),
+            "arm": self._safe_arm(track),
+            "is_frozen": self._is_frozen(track),
+            "is_group_track": self._is_group_track(track),
+            "mute": bool(getattr(track, "mute", False)),
+            "solo": bool(getattr(track, "solo", False)),
+            "volume": volume,
+            "panning": panning,
+            "sends": sends,
+            "monitoring": (
+                _MONITORING_NAME_BY_STATE.get(monitoring) if monitoring is not None else None
+            ),
+            "monitoring_value": monitoring,
+            "input_routing_type": input_type,
+            "input_routing_channel": input_channel,
+            "available_input_routing_types": input_types,
+            "available_input_routing_channels": input_channels,
+            "output_routing_type": output_type,
+            "output_routing_channel": output_channel,
+        }
+
+    def _cmd_get_track_mixer_state(self, params):
+        self._reject_unknown(params, ("track_index",))
+        track_index = self._require_present_int(params, "track_index")
+        track = self._track_at(track_index)
+        return self._mixer_state(track_index, track)
+
+    def _cmd_set_track_arm(self, params):
+        self._reject_unknown(params, ("track_index", "armed"))
+        track_index = self._require_present_int(params, "track_index")
+        armed = self._require_present_bool(params, "armed")
+        track = self._track_at(track_index)
+        self._assert_can_arm(track)
+        value, changed = self._assign_bool_attr(track, "arm", armed)
+        return {
+            "track_index": track_index,
+            "arm": value,
+            "changed": changed,
+            "exclusive_arm": self._optional_song_value("exclusive_arm", bool, None),
+        }
+
+    def _cmd_set_track_mute(self, params):
+        return self._set_track_flag(params, "mute", "mute")
+
+    def _cmd_set_track_solo(self, params):
+        return self._set_track_flag(params, "solo", "solo")
+
+    def _set_track_flag(self, params, attr, param_name):
+        self._reject_unknown(params, ("track_index", param_name))
+        track_index = self._require_present_int(params, "track_index")
+        value = self._require_present_bool(params, param_name)
+        track = self._track_at(track_index)
+        written, changed = self._assign_bool_attr(track, attr, value)
+        return {"track_index": track_index, attr: written, "changed": changed}
+
+    def _cmd_set_track_volume(self, params):
+        return self._set_track_mixer_param(params, "volume", "volume")
+
+    def _cmd_set_track_panning(self, params):
+        return self._set_track_mixer_param(params, "panning", "panning")
+
+    def _set_track_mixer_param(self, params, attr, label):
+        self._reject_unknown(params, ("track_index", "value"))
+        track_index = self._require_present_int(params, "track_index")
+        if "value" not in params:
+            raise ValueError("value is required")
+        # Range is checked before assignment inside _assign_param.
+        track = self._track_at(track_index)
+        param = getattr(self._mixer(track), attr)
+        value, changed = self._assign_param(param, params["value"], label)
+        return {
+            "track_index": track_index,
+            label: value,
+            "changed": changed,
+            "min": float(param.min),
+            "max": float(param.max),
+        }
+
+    def _cmd_set_track_send(self, params):
+        self._reject_unknown(params, ("track_index", "send_index", "value"))
+        track_index = self._require_present_int(params, "track_index")
+        send_index = self._require_present_int(params, "send_index")
+        if "value" not in params:
+            raise ValueError("value is required")
+        track = self._track_at(track_index)
+        try:
+            sends = list(self._mixer(track).sends)
+        except Exception as e:
+            raise ValueError("Track sends could not be read (%s)" % e)
+        if send_index < 0 or send_index >= len(sends):
+            raise ValueError(
+                "send_index out of range (track has %d sends)" % len(sends)
+            )
+        value, changed = self._assign_param(
+            sends[send_index], params["value"], "send"
+        )
+        return {
+            "track_index": track_index,
+            "send_index": send_index,
+            "value": value,
+            "changed": changed,
+            "min": float(sends[send_index].min),
+            "max": float(sends[send_index].max),
+        }
+
+    def _cmd_set_track_monitoring(self, params):
+        self._reject_unknown(params, ("track_index", "monitoring"))
+        track_index = self._require_present_int(params, "track_index")
+        if "monitoring" not in params:
+            raise ValueError("monitoring is required")
+        state = self._monitoring_value(params["monitoring"])
+        track = self._track_at(track_index)
+        if self._is_frozen(track):
+            raise ValueError("Track is frozen; monitoring was not changed")
+        current = self._require_monitoring(track)
+        changed = current != state
+        if changed:
+            track.current_monitoring_state = state
+        readback = self._read_monitoring(track)
+        return {
+            "track_index": track_index,
+            "monitoring": _MONITORING_NAME_BY_STATE.get(readback, "unknown"),
+            "monitoring_value": readback,
+            "changed": changed,
+        }
+
+    def _cmd_set_track_input_routing(self, params):
+        self._reject_unknown(
+            params, ("track_index", "input_routing_type", "input_routing_channel")
+        )
+        track_index = self._require_present_int(params, "track_index")
+        type_name = params.get("input_routing_type")
+        channel_name = params.get("input_routing_channel")
+        if type_name is None and channel_name is None:
+            raise ValueError(
+                "input_routing_type or input_routing_channel is required"
+            )
+        track = self._track_at(track_index)
+        if self._is_frozen(track):
+            raise ValueError("Track is frozen; input routing was not changed")
+        routing_type = None
+        routing_channel = None
+        deferred_channel = None
+        if type_name is not None:
+            options = self._routing_options(
+                track, "available_input_routing_types", "input routing types"
+            )
+            routing_type = self._match_routing(options, type_name, "input routing type")
+            if channel_name is not None:
+                # Channel list changes with the type, so resolve it after the
+                # type write. _assign_input_routing restores the type on failure.
+                deferred_channel = channel_name
+        elif channel_name is not None:
+            options = self._routing_options(
+                track, "available_input_routing_channels", "input routing channels"
+            )
+            routing_channel = self._match_routing(
+                options, channel_name, "input routing channel"
+            )
+        self._assign_input_routing(track, routing_type, routing_channel, deferred_channel)
+        return self._mixer_state(track_index, track)
+
+    def _cmd_set_arrangement_overdub(self, params):
+        self._reject_unknown(params, ("enabled",))
+        enabled = self._require_present_bool(params, "enabled")
+        value, changed = self._assign_song_bool("arrangement_overdub", enabled)
+        return {
+            "arrangement_overdub": value,
+            "changed": changed,
+            "record_mode": self._read_song_bool("record_mode"),
+            "note": (
+                "This sets MIDI arrangement overdub only. It does not start "
+                "or stop the transport or the arrangement record button."
+            ),
+        }
+
+    def _cmd_set_arrangement_record(self, params):
+        self._reject_unknown(params, ("enabled", "allow_overwrite"))
+        enabled = self._require_present_bool(params, "enabled")
+        allow = self._require_bool(params.get("allow_overwrite", False), "allow_overwrite")
+        current = self._read_song_bool("record_mode")
+        if current == enabled:
+            return {
+                "record_mode": current,
+                "changed": False,
+                "allow_overwrite": allow,
+                "deleted": False,
+            }
+        blockers = []
+        unverified = []
+        song_time = None
+        if enabled:
+            song_time, blockers, unverified = self._arrangement_record_blockers()
+            if not allow and (blockers or unverified or song_time is None):
+                parts = []
+                for item in blockers:
+                    parts.append(
+                        "track %s arrangement clip %s (%s to %s beats)"
+                        % (
+                            item.get("track_index"),
+                            item.get("clip_index"),
+                            item.get("start_time"),
+                            item.get("end_time"),
+                        )
+                    )
+                if unverified:
+                    parts.append(
+                        "could not verify arrangement clips on tracks %s"
+                        % ", ".join(str(i) for i in unverified)
+                    )
+                raise ValueError(
+                    "Refusing to enable arrangement record because it would "
+                    "write over existing arrangement clips at the playhead, "
+                    "or those clips could not be checked (%s). Pass "
+                    "allow_overwrite=true to set the record button anyway. "
+                    "record_mode was not changed."
+                    % ("; ".join(parts) or "unverified")
+                )
+        value, changed = self._assign_song_bool("record_mode", enabled)
+        result = self._song_transport_snapshot()
+        result.update({
+            "record_mode": value,
+            "changed": changed,
+            "allow_overwrite": allow,
+            "existing_clips": blockers,
+            "deleted": False,
+            "note": (
+                "record_mode is the arrangement record button only. Playback "
+                "was not started or stopped. Recorded arrangement material is "
+                "left in place when recording is turned off."
+            ),
+        })
+        return result
+
+    def _cmd_set_session_record(self, params):
+        self._reject_unknown(params, ("enabled", "allow_overwrite"))
+        enabled = self._require_present_bool(params, "enabled")
+        allow = self._require_bool(params.get("allow_overwrite", False), "allow_overwrite")
+        current = self._read_song_bool("session_record")
+        if current == enabled:
+            return {
+                "session_record": current,
+                "changed": False,
+                "allow_overwrite": allow,
+                "deleted": False,
+            }
+        scene_index = None
+        armed = []
+        conflicts = []
+        if enabled:
+            scene_index, armed, conflicts = self._session_record_blockers()
+            unresolved = scene_index is None and len(armed) > 0
+            if not allow and (conflicts or unresolved):
+                if unresolved:
+                    why = (
+                        "the selected scene could not be read while tracks "
+                        "%s are armed" % ", ".join(str(i) for i in armed)
+                    )
+                else:
+                    why = self._format_slot_conflicts(conflicts)
+                raise ValueError(
+                    "Refusing to enable session record because it records "
+                    "into the selected scene of every armed track and "
+                    "overdubs a playing clip (%s). Pass allow_overwrite=true "
+                    "to set the button anyway. session_record was not changed."
+                    % why
+                )
+        value, changed = self._assign_song_bool("session_record", enabled)
+        result = self._song_transport_snapshot()
+        result.update({
+            "session_record": value,
+            "changed": changed,
+            "allow_overwrite": allow,
+            "existing_clips": conflicts,
+            "armed_tracks": armed,
+            "deleted": False,
+            "note": (
+                "session_record is the session record button. This does not "
+                "call trigger_session_record, does not delete clips, and does "
+                "not stop the transport. Turning it off leaves recorded clips "
+                "in place. For one empty slot, use record_empty_slot."
+            ),
+        })
+        return result
+
+    def _cmd_record_empty_slot(self, params):
+        self._reject_unknown(params, ("track_index", "clip_index", "arm", "record_length"))
+        track_index = self._require_present_int(params, "track_index")
+        clip_index = self._require_present_int(params, "clip_index")
+        if "arm" in params:
+            arm = self._require_bool(params["arm"], "arm")
+        else:
+            arm = True
+        record_length = None
+        if "record_length" in params and params["record_length"] is not None:
+            record_length = self._require_record_length(params["record_length"])
+        track = self._track_at(track_index)
+        if self._is_frozen(track):
+            raise ValueError("Track is frozen; nothing was armed or fired")
+        if self._is_group_track(track):
+            raise ValueError(
+                "Group tracks are not recorded with record_empty_slot; "
+                "nothing was armed or fired"
+            )
+        self._assert_can_arm(track)
+        slot = self._slot_at(track, clip_index)
+        if bool(getattr(slot, "has_clip", False)) or self._slot_is_recording(slot):
+            raise ValueError(
+                "Clip slot %d on track %d already has a clip or is recording. "
+                "record_empty_slot will not overwrite it. Nothing was fired."
+                % (clip_index, track_index)
+            )
+        if not callable(getattr(slot, "fire", None)):
+            raise ValueError("Clip slot cannot be fired; nothing was changed")
+        currently_armed = self._safe_arm(track)
+        if not arm and not currently_armed:
+            raise ValueError(
+                "Track is not armed. Firing an empty slot on an unarmed track "
+                "triggers that track's stop button, so the slot was not fired. "
+                "Pass arm=true or arm the track first."
+            )
+        arm_changed = False
+        if arm and not currently_armed:
+            track.arm = True
+            arm_changed = True
+            if not self._safe_arm(track):
+                raise ValueError("Track did not arm; the slot was not fired")
+        try:
+            if record_length is None:
+                slot.fire()
+            else:
+                slot.fire(record_length)
+        except Exception:
+            if arm_changed:
+                try:
+                    track.arm = False
+                except Exception as restore_error:
+                    self.log_message("arm restore failed: " + str(restore_error))
+            raise
+        return {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "triggered": True,
+            "record_length": record_length,
+            "arm": self._safe_arm(track),
+            "arm_changed": arm_changed,
+            "deleted": False,
+            "session_record": self._read_song_bool("session_record"),
+            "exclusive_arm": self._optional_song_value("exclusive_arm", bool, None),
+            "note": (
+                "The empty slot was fired. Live may wait for the current "
+                "launch quantization before capturing. This response means "
+                "the slot was fired, not that audio has been recorded, and "
+                "it is not a real-time acknowledgement. Fixed length uses "
+                "ClipSlot.fire(record_length) on this slot only."
+            ),
+        }
+
+    def _cmd_stop_recording(self, params):
+        self._reject_unknown(params, ("scope", "track_index", "clip_index"))
+        if "scope" not in params:
+            raise ValueError("scope is required")
+        scope = params["scope"]
+        if not isinstance(scope, str) or scope not in _STOP_RECORDING_SCOPES:
+            raise ValueError(
+                "scope must be one of: arrangement, session, slot, recording"
+            )
+        if scope != "slot" and (
+            "track_index" in params or "clip_index" in params
+        ):
+            raise ValueError(
+                "track_index and clip_index are only valid when scope is slot"
+            )
+        if scope == "arrangement":
+            value, changed = self._assign_song_bool("record_mode", False)
+            result = self._song_transport_snapshot()
+            result.update({
+                "scope": "arrangement",
+                "changed": changed,
+                "record_mode": value,
+                "deleted": False,
+                "note": (
+                    "Arrangement record was set off. Playback was not stopped "
+                    "and clips were not deleted."
+                ),
+            })
+            return result
+        if scope == "session":
+            value, changed = self._assign_song_bool("session_record", False)
+            result = self._song_transport_snapshot()
+            result.update({
+                "scope": "session",
+                "changed": changed,
+                "session_record": value,
+                "deleted": False,
+                "note": (
+                    "Session record was set off. Playback was not stopped "
+                    "and clips were not deleted."
+                ),
+            })
+            return result
+        if scope == "slot":
+            return self._stop_recording_slot(params)
+        return self._stop_all_recording_activity()
+
+    def _stop_recording_slot(self, params):
+        track_index = self._require_present_int(params, "track_index")
+        clip_index = self._require_present_int(params, "clip_index")
+        track = self._track_at(track_index)
+        slot = self._slot_at(track, clip_index)
+        if not self._slot_is_recording(slot):
+            return {
+                "scope": "slot",
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "changed": False,
+                "stopped": False,
+                "deleted": False,
+                "note": "Slot is not recording; stop was not called.",
+            }
+        if self._is_group_track(track):
+            raise ValueError(
+                "Refusing to stop a group-track slot; Live would stop every "
+                "track in the group. Stop the child track that is recording."
+            )
+        slot.stop()
+        return {
+            "scope": "slot",
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "changed": True,
+            "stopped": True,
+            "deleted": False,
+            "record_mode": self._read_song_bool("record_mode"),
+            "session_record": self._read_song_bool("session_record"),
+            "is_playing": self._optional_song_value("is_playing", bool, None),
+            "note": (
+                "ClipSlot.stop() ends session clips on this track. The "
+                "recorded clip is kept. Other tracks, arrangement record, "
+                "and the transport were not changed."
+            ),
+        }
+
+    def _stop_all_recording_activity(self):
+        changed = False
+        if self._read_song_bool("record_mode"):
+            self._assign_song_bool("record_mode", False)
+            changed = True
+        if self._read_song_bool("session_record"):
+            self._assign_song_bool("session_record", False)
+            changed = True
+        stopped_tracks = []
+        for track_index, track in enumerate(self._iter_tracks()):
+            if self._is_group_track(track):
+                continue
+            slots = self._recording_slot_indexes(track)
+            if not slots:
+                continue
+            self._slot_at(track, slots[0]).stop()
+            stopped_tracks.append({
+                "track_index": track_index,
+                "clip_indexes": slots,
+            })
+            changed = True
+        result = self._song_transport_snapshot()
+        result.update({
+            "scope": "recording",
+            "changed": changed,
+            "stopped_tracks": stopped_tracks,
+            "deleted": False,
+            "note": (
+                "Arrangement record and session record were set off, and "
+                "session clips were stopped only on tracks that were "
+                "recording. Playing tracks were left playing. Nothing was "
+                "deleted and the transport was not stopped."
+            ),
+        })
+        return result
+
+    def _normalize_sends(self, raw):
+        if not isinstance(raw, list):
+            raise ValueError("sends must be a list of {index, value} objects")
+        normalized = []
+        seen = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("each send must be an object with index and value")
+            extra = [key for key in item.keys() if key not in ("index", "value")]
+            if extra:
+                raise ValueError("send objects only accept index and value")
+            if "index" not in item or "value" not in item:
+                raise ValueError("each send needs index and value")
+            index = self._require_int(item["index"], "send index")
+            if index in seen:
+                raise ValueError("duplicate send index %d" % index)
+            seen.add(index)
+            normalized.append((index, item["value"]))
+        return normalized
+
+    def _plan_prepare(self, track, params):
+        """Validate a prepare_track request. Does not write."""
+        plan = {
+            "name": None,
+            "arm": None,
+            "mute": None,
+            "solo": None,
+            "volume": None,
+            "panning": None,
+            "sends": [],
+            "monitoring": None,
+            "routing_type": None,
+            "routing_channel": None,
+            "routing_channel_name": None,
+        }
+        if "name" in params:
+            name = params["name"]
+            if not isinstance(name, str):
+                raise ValueError("name must be a string")
+            if len(name) > 256:
+                raise ValueError("name must be at most 256 characters")
+            plan["name"] = name
+        for attr, key in (("arm", "arm"), ("mute", "mute"), ("solo", "solo")):
+            if key in params:
+                plan[attr] = self._require_bool(params[key], key)
+        if plan["arm"] is not None:
+            self._assert_can_arm(track)
+        mixer = None
+        if "volume" in params or "panning" in params or "sends" in params:
+            mixer = self._mixer(track)
+        if "volume" in params:
+            # _assign_param validates and would write. Validate range only.
+            self._check_param_range(mixer.volume, params["volume"], "volume")
+            plan["volume"] = self._finite_float(params["volume"], "volume")
+        if "panning" in params:
+            self._check_param_range(mixer.panning, params["panning"], "panning")
+            plan["panning"] = self._finite_float(params["panning"], "panning")
+        if "sends" in params:
+            sends = list(mixer.sends)
+            for index, value in self._normalize_sends(params["sends"]):
+                if index < 0 or index >= len(sends):
+                    raise ValueError(
+                        "send_index out of range (track has %d sends)" % len(sends)
+                    )
+                self._check_param_range(sends[index], value, "send")
+                plan["sends"].append((index, self._finite_float(value, "send")))
+        if "monitoring" in params:
+            if self._is_frozen(track):
+                raise ValueError("Track is frozen; monitoring was not changed")
+            self._require_monitoring(track)
+            plan["monitoring"] = self._monitoring_value(params["monitoring"])
+        type_name = params.get("input_routing_type")
+        channel_name = params.get("input_routing_channel")
+        if type_name is not None or channel_name is not None:
+            if self._is_frozen(track):
+                raise ValueError("Track is frozen; input routing was not changed")
+            if type_name is not None:
+                options = self._routing_options(
+                    track, "available_input_routing_types", "input routing types"
+                )
+                plan["routing_type"] = self._match_routing(
+                    options, type_name, "input routing type"
+                )
+                if channel_name is not None:
+                    plan["routing_channel_name"] = channel_name
+                    if not isinstance(channel_name, str) or channel_name.strip() == "":
+                        raise ValueError(
+                            "input routing channel must be a non-empty string"
+                        )
+            elif channel_name is not None:
+                options = self._routing_options(
+                    track,
+                    "available_input_routing_channels",
+                    "input routing channels",
+                )
+                plan["routing_channel"] = self._match_routing(
+                    options, channel_name, "input routing channel"
+                )
+        writes = any([
+            plan["name"] is not None,
+            plan["arm"] is not None,
+            plan["mute"] is not None,
+            plan["solo"] is not None,
+            plan["volume"] is not None,
+            plan["panning"] is not None,
+            plan["sends"],
+            plan["monitoring"] is not None,
+            plan["routing_type"] is not None,
+            plan["routing_channel"] is not None,
+            plan["routing_channel_name"] is not None,
+        ])
+        plan["writes"] = writes
+        return plan
+
+    def _check_param_range(self, param, value, label):
+        value = self._finite_float(value, label)
+        try:
+            lo = float(param.min)
+            hi = float(param.max)
+        except Exception as e:
+            raise ValueError("%s range could not be read (%s)" % (label, e))
+        if value < lo or value > hi:
+            raise ValueError("%s must be between %s and %s" % (label, lo, hi))
+        return value
+
+    def _apply_prepare(self, track, plan):
+        """Apply a validated plan. Returns True when a Live value changed."""
+        changed = False
+        # Routing first so a failed channel match restores the type before
+        # any other field is written.
+        if (
+            plan["routing_type"] is not None
+            or plan["routing_channel"] is not None
+            or plan["routing_channel_name"] is not None
+        ):
+            changed = self._assign_input_routing(
+                track,
+                plan["routing_type"],
+                plan["routing_channel"],
+                plan["routing_channel_name"],
+            ) or changed
+        if plan["name"] is not None and track.name != plan["name"]:
+            track.name = plan["name"]
+            changed = True
+        if plan["monitoring"] is not None:
+            current = self._read_monitoring(track)
+            if current != plan["monitoring"]:
+                track.current_monitoring_state = plan["monitoring"]
+                changed = True
+        mixer = None
+        if plan["volume"] is not None or plan["panning"] is not None or plan["sends"]:
+            mixer = self._mixer(track)
+        if plan["volume"] is not None:
+            _value, wrote = self._assign_param(mixer.volume, plan["volume"], "volume")
+            changed = changed or wrote
+        if plan["panning"] is not None:
+            _value, wrote = self._assign_param(mixer.panning, plan["panning"], "panning")
+            changed = changed or wrote
+        if plan["sends"]:
+            sends = list(mixer.sends)
+            for index, value in plan["sends"]:
+                _value, wrote = self._assign_param(sends[index], value, "send")
+                changed = changed or wrote
+        if plan["mute"] is not None:
+            _value, wrote = self._assign_bool_attr(track, "mute", plan["mute"])
+            changed = changed or wrote
+        if plan["solo"] is not None:
+            _value, wrote = self._assign_bool_attr(track, "solo", plan["solo"])
+            changed = changed or wrote
+        if plan["arm"] is not None:
+            _value, wrote = self._assign_bool_attr(track, "arm", plan["arm"])
+            changed = changed or wrote
+        return changed
+
+    def _cmd_prepare_track(self, params):
+        self._reject_unknown(params, (
+            "track_index",
+            "name",
+            "arm",
+            "mute",
+            "solo",
+            "volume",
+            "panning",
+            "sends",
+            "monitoring",
+            "input_routing_type",
+            "input_routing_channel",
+        ))
+        track_index = self._require_present_int(params, "track_index")
+        track = self._track_at(track_index)
+        plan = self._plan_prepare(track, params)
+        changed = False
+        if plan["writes"]:
+            changed = self._apply_prepare(track, plan)
+        state = self._mixer_state(track_index, track)
+        state["changed"] = bool(changed)
+        state["note"] = (
+            "prepare_track applies only the fields you send, in one main-thread "
+            "turn. Omitted fields are left alone. This does not start recording."
+        )
+        return state
+
+    def _clip_for_region(self, track, clip_index, view):
+        if view == "session":
+            slot = self._slot_at(track, clip_index)
+            if not bool(getattr(slot, "has_clip", False)):
+                raise ValueError("No clip in slot")
+            return slot.clip
+        try:
+            clips = list(track.arrangement_clips)
+        except Exception as e:
+            raise ValueError("Arrangement clips are not available (%s)" % e)
+        if clip_index < 0 or clip_index >= len(clips):
+            raise IndexError("Arrangement clip index out of range")
+        return clips[clip_index]
+
+    def _region_units(self, clip):
+        is_audio = bool(getattr(clip, "is_audio_clip", False))
+        try:
+            warping = getattr(clip, "warping")
+        except Exception:
+            warping = None
+        if not is_audio or warping:
+            return "beats", warping
+        if warping is False:
+            return "seconds", warping
+        return "unknown", warping
+
+    def _clip_region_payload(self, track_index, clip_index, view, clip):
+        units, warping = self._region_units(clip)
+
+        def _num(attr):
+            try:
+                value = getattr(clip, attr)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return None
+                value = float(value)
+                if value != value or value in (float("inf"), float("-inf")):
+                    return None
+                return value
+            except Exception:
+                return None
+
+        return {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "view": view,
+            "name": getattr(clip, "name", ""),
+            "is_audio_clip": bool(getattr(clip, "is_audio_clip", False)),
+            "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
+            "is_recording": bool(getattr(clip, "is_recording", False)),
+            "warping": None if warping is None else bool(warping),
+            "units": units,
+            "length": _num("length"),
+            "start_marker": _num("start_marker"),
+            "end_marker": _num("end_marker"),
+            "loop_start": _num("loop_start"),
+            "loop_end": _num("loop_end"),
+            "looping": self._optional_bool_attr(clip, "looping"),
+            "crop": False,
+            "note": (
+                "Markers describe the playback region. They do not crop the "
+                "clip or replace the source file. Units are beats for MIDI "
+                "and warped audio, and seconds for unwarped audio."
+            ),
+        }
+
+    def _optional_bool_attr(self, obj, attr):
+        try:
+            value = getattr(obj, attr)
+        except Exception:
+            return None
+        if isinstance(value, bool):
+            return value
+        return None
+
+    def _cmd_get_clip_region(self, params):
+        self._reject_unknown(params, ("track_index", "clip_index", "view"))
+        track_index = self._require_present_int(params, "track_index")
+        clip_index = self._require_present_int(params, "clip_index")
+        view = params.get("view", "session")
+        if not isinstance(view, str) or view not in _CLIP_REGION_VIEWS:
+            raise ValueError("view must be session or arrangement")
+        track = self._track_at(track_index)
+        clip = self._clip_for_region(track, clip_index, view)
+        return self._clip_region_payload(track_index, clip_index, view, clip)
+
+    def _read_marker(self, clip, attr):
+        try:
+            value = getattr(clip, attr)
+        except Exception as e:
+            raise ValueError("Could not read %s (%s); no markers were changed" % (attr, e))
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("Could not read %s; no markers were changed" % attr)
+        value = float(value)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("Could not read %s; no markers were changed" % attr)
+        return value
+
+    def _restore_clip_region(self, clip, saved):
+        start = saved["start"]
+        end = saved["end"]
+        loop_start = saved.get("loop_start")
+        loop_end = saved.get("loop_end")
+        looping = saved.get("looping")
+        try:
+            if float(clip.end_marker) < float(end):
+                clip.end_marker = end
+            if float(clip.start_marker) != float(start):
+                clip.start_marker = start
+            if float(clip.end_marker) != float(end):
+                clip.end_marker = end
+            if loop_start is not None and loop_end is not None:
+                if float(clip.loop_end) < float(loop_end):
+                    clip.loop_end = loop_end
+                if float(clip.loop_start) != float(loop_start):
+                    clip.loop_start = loop_start
+                if float(clip.loop_end) != float(loop_end):
+                    clip.loop_end = loop_end
+            if looping is not None and bool(clip.looping) != bool(looping):
+                clip.looping = looping
+        except Exception as restore_error:
+            self.log_message("clip region restore failed: " + str(restore_error))
+
+    def _cmd_set_clip_region(self, params):
+        self._reject_unknown(params, (
+            "track_index",
+            "clip_index",
+            "view",
+            "start_marker",
+            "end_marker",
+            "loop_start",
+            "loop_end",
+            "looping",
+        ))
+        track_index = self._require_present_int(params, "track_index")
+        clip_index = self._require_present_int(params, "clip_index")
+        view = params.get("view", "session")
+        if not isinstance(view, str) or view not in _CLIP_REGION_VIEWS:
+            raise ValueError("view must be session or arrangement")
+        fields = ("start_marker", "end_marker", "loop_start", "loop_end", "looping")
+        if not any(name in params for name in fields):
+            raise ValueError(
+                "Set at least one of start_marker, end_marker, loop_start, "
+                "loop_end, looping"
+            )
+        track = self._track_at(track_index)
+        clip = self._clip_for_region(track, clip_index, view)
+        if bool(getattr(clip, "is_recording", False)):
+            raise ValueError(
+                "Clip is recording; markers were not changed. Stop recording first."
+            )
+        cur_start = self._read_marker(clip, "start_marker")
+        cur_end = self._read_marker(clip, "end_marker")
+        new_start = cur_start
+        new_end = cur_end
+        if "start_marker" in params:
+            new_start = self._finite_float(params["start_marker"], "start_marker")
+        if "end_marker" in params:
+            new_end = self._finite_float(params["end_marker"], "end_marker")
+        if new_end <= new_start:
+            raise ValueError(
+                "end_marker must be greater than start_marker; no markers were changed"
+            )
+        touch_loop = any(name in params for name in ("loop_start", "loop_end", "looping"))
+        cur_loop_start = cur_loop_end = None
+        new_loop_start = new_loop_end = None
+        new_looping = None
+        if touch_loop or "start_marker" in params or "end_marker" in params:
+            try:
+                cur_loop_start = self._read_marker(clip, "loop_start")
+                cur_loop_end = self._read_marker(clip, "loop_end")
+            except ValueError:
+                if touch_loop:
+                    raise
+                cur_loop_start = None
+                cur_loop_end = None
+        if cur_loop_start is not None:
+            new_loop_start = cur_loop_start
+            new_loop_end = cur_loop_end
+            if "loop_start" in params:
+                new_loop_start = self._finite_float(params["loop_start"], "loop_start")
+            if "loop_end" in params:
+                new_loop_end = self._finite_float(params["loop_end"], "loop_end")
+            if new_loop_end <= new_loop_start:
+                raise ValueError(
+                    "loop_end must be greater than loop_start; no markers were changed"
+                )
+            if new_loop_start < new_start - 1e-9 or new_loop_end > new_end + 1e-9:
+                raise ValueError(
+                    "loop range must lie within start_marker and end_marker; "
+                    "no markers were changed"
+                )
+        if "looping" in params:
+            new_looping = self._require_bool(params["looping"], "looping")
+            is_audio = bool(getattr(clip, "is_audio_clip", False))
+            warping = getattr(clip, "warping", None)
+            if new_looping is True and is_audio and warping is False:
+                raise ValueError(
+                    "Unwarped audio clips cannot be looped; no markers were changed"
+                )
+        looping_now = None
+        try:
+            if isinstance(getattr(clip, "looping"), bool):
+                looping_now = bool(clip.looping)
+        except Exception:
+            looping_now = None
+        saved = {
+            "start": cur_start,
+            "end": cur_end,
+            "loop_start": cur_loop_start,
+            "loop_end": cur_loop_end,
+            "looping": looping_now,
+        }
+        marker_changes = new_start != cur_start or new_end != cur_end
+        loop_changes = (
+            cur_loop_start is not None
+            and (new_loop_start != cur_loop_start or new_loop_end != cur_loop_end)
+        )
+        looping_changes = new_looping is not None and new_looping != looping_now
+        if not marker_changes and not loop_changes and not looping_changes:
+            payload = self._clip_region_payload(track_index, clip_index, view, clip)
+            payload["changed"] = False
+            payload["deleted"] = False
+            return payload
+        try:
+            # Widen markers, move the loop inside that wider region, then
+            # shrink markers. That order keeps start <= end and the loop
+            # inside the markers at every step.
+            if new_end > cur_end:
+                clip.end_marker = new_end
+            if new_start < cur_start:
+                clip.start_marker = new_start
+            if loop_changes:
+                if new_loop_end > cur_loop_end:
+                    clip.loop_end = new_loop_end
+                if new_loop_start != cur_loop_start:
+                    clip.loop_start = new_loop_start
+                if new_loop_end != cur_loop_end and new_loop_end <= cur_loop_end:
+                    clip.loop_end = new_loop_end
+            if new_start > cur_start:
+                clip.start_marker = new_start
+            if new_end < cur_end:
+                clip.end_marker = new_end
+            if looping_changes:
+                clip.looping = new_looping
+        except Exception:
+            self._restore_clip_region(clip, saved)
+            raise
+        payload = self._clip_region_payload(track_index, clip_index, view, clip)
+        payload["changed"] = True
+        payload["deleted"] = False
+        return payload

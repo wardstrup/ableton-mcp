@@ -251,6 +251,11 @@ Once the config file has been set on Claude, and the remote script is running in
 - Load instruments and effects from Ableton's browser
 - Add notes to MIDI clips
 - Change tempo and other session parameters
+- Arm tracks, set monitoring and input routing, and set mixer volume, pan, sends, mute, and solo
+- Start arrangement record, session record, or recording into one empty Session slot, and stop those without deleting clips
+- Read and move clip start/end markers without cropping the sample
+
+Recording commands, their safety rules, and what still has to be checked inside Live are in [docs/recording-workflow.md](docs/recording-workflow.md).
 
 ### Example Commands
 
