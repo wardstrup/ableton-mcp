@@ -57,6 +57,13 @@ MODIFYING_TOOLS = {
     "quick_arrangement_record",
     "quick_arrangement_stop",
     "set_mixer_batch",
+    "record_loop",
+    "stop_record_loop",
+    "stop_take",
+    "set_metronome",
+    "set_count_in",
+    "create_scene",
+    "keep_take",
 }
 
 _PARAM_KEYS = (
@@ -115,6 +122,11 @@ _PARAM_KEYS = (
     "start_time",
     "on",
     "pan",
+    "bars",
+    "max_takes",
+    "pre_roll_bars",
+    "discard_current",
+    "take",
 )
 
 # A `path` ending in one of these is a file on disk, not a Live browser category.

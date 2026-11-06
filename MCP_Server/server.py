@@ -150,6 +150,9 @@ class AbletonConnection:
             "prepare_track", "set_clip_region",
             "quick_record", "quick_arrangement_record",
             "quick_arrangement_stop", "set_mixer_batch",
+            "record_loop", "stop_record_loop", "stop_take",
+            "set_metronome", "set_count_in", "create_scene",
+            "keep_take", "list_takes",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1565,19 +1568,25 @@ def quick_record(
     input_routing_type: Optional[str] = None,
     input_routing_channel: Optional[str] = None,
     disarm_after: bool = False,
+    pre_roll_bars: Optional[float] = None,
+    create_scene_if_full: bool = False,
     user_prompt: str = "",
 ) -> str:
     """Arm if needed, pick an empty Session slot, and fire it for a fixed length.
 
     Pass bars or beats, not both. slot_index defaults to the first empty slot.
-    Launch quantization is left untouched. The call returns when Live accepts
-    the fire, not when the take finishes. disarm_after drops arm after the fire.
-    Missing audio input or a stuck playhead is reported in warnings and does not block.
+    This fire uses launch quantization none so the length is exact; the song's
+    quantization setting is not changed. Monitoring defaults to auto; pass
+    monitoring='keep' to leave it. disarm_after arms until the take stops
+    recording, not before. pre_roll_bars starts the metronome and records
+    after that many bars without blocking. create_scene_if_full appends a
+    scene when every slot is full.
     """
     if monitoring is not None and (
-        not isinstance(monitoring, str) or monitoring.strip().lower() not in _MONITORING_NAMES
+        not isinstance(monitoring, str)
+        or monitoring.strip().lower() not in (_MONITORING_NAMES | {"keep"})
     ):
-        return "Error quick_record: monitoring must be one of in, auto, off"
+        return "Error quick_record: monitoring must be auto, in, off, or keep"
     if (beats is None) == (bars is None):
         return "Error quick_record: pass bars or beats, not both and not neither"
     length_error = _reject_record_length(beats) if beats is not None else None
@@ -1595,6 +1604,8 @@ def quick_record(
         "input_routing_type": input_routing_type,
         "input_routing_channel": input_routing_channel,
         "disarm_after": disarm_after,
+        "pre_roll_bars": pre_roll_bars,
+        "create_scene_if_full": create_scene_if_full,
     })
     return _recording_call("quick_record", params)
 
@@ -1664,6 +1675,158 @@ def set_mixer_batch(
     if not isinstance(tracks, list):
         return "Error set_mixer_batch: tracks must be a list"
     return _recording_call("set_mixer_batch", {"tracks": tracks})
+
+
+@mcp.tool()
+@telemetry_tool("record_loop")
+@trajectory_tool("record_loop")
+def record_loop(
+    ctx: Context,
+    track_index: int,
+    bars: float,
+    max_takes: Optional[int] = None,
+    monitoring: Optional[str] = None,
+    pre_roll_bars: Optional[float] = None,
+    user_prompt: str = "",
+) -> str:
+    """Chain fixed-length takes on one track without blocking Live's main thread.
+
+    Each take is bars long. The next empty slot is fired when the current take
+    stops recording. A scene is created when the track has no empty slot.
+    Without max_takes the loop stops at 128 takes or at stop_record_loop.
+    Monitoring defaults to auto.
+    """
+    if monitoring is not None and (
+        not isinstance(monitoring, str)
+        or monitoring.strip().lower() not in (_MONITORING_NAMES | {"keep"})
+    ):
+        return "Error record_loop: monitoring must be auto, in, off, or keep"
+    params = _omit_none({
+        "track_index": track_index,
+        "bars": bars,
+        "max_takes": max_takes,
+        "monitoring": None if monitoring is None else monitoring.strip().lower(),
+        "pre_roll_bars": pre_roll_bars,
+    })
+    return _recording_call("record_loop", params)
+
+
+@mcp.tool()
+@telemetry_tool("stop_record_loop")
+@trajectory_tool("stop_record_loop")
+def stop_record_loop(
+    ctx: Context,
+    track_index: int,
+    discard_current: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """Stop a record_loop immediately.
+
+    discard_current deletes only the clip that is recording when this call
+    arrives, so a spoken stop does not remain in the take. Finished takes stay.
+    """
+    return _recording_call("stop_record_loop", {
+        "track_index": track_index,
+        "discard_current": discard_current,
+    })
+
+
+@mcp.tool()
+@telemetry_tool("stop_take")
+@trajectory_tool("stop_take")
+def stop_take(
+    ctx: Context,
+    track_index: Optional[int] = None,
+    discard_current: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """Stop the clip that is recording now.
+
+    discard_current defaults to true and deletes only that clip. Pass false
+    to keep it. Other clips are not deleted.
+    """
+    params = {"discard_current": discard_current}
+    if track_index is not None:
+        params["track_index"] = track_index
+    return _recording_call("stop_take", params)
+
+
+@mcp.tool()
+@telemetry_tool("set_metronome")
+@trajectory_tool("set_metronome")
+def set_metronome(
+    ctx: Context,
+    enabled: Optional[bool] = None,
+    on: Optional[bool] = None,
+    user_prompt: str = "",
+) -> str:
+    """Set Song.metronome explicitly. Pass enabled or on. This does not start playback."""
+    if enabled is None and on is None:
+        return "Error set_metronome: enabled or on is required"
+    if enabled is not None and on is not None and enabled != on:
+        return "Error set_metronome: conflicting enabled and on"
+    params = {}
+    if enabled is not None:
+        params["enabled"] = enabled
+    if on is not None:
+        params["on"] = on
+    return _recording_call("set_metronome", params)
+
+
+@mcp.tool()
+@telemetry_tool("set_count_in")
+@trajectory_tool("set_count_in")
+def set_count_in(ctx: Context, bars: int, user_prompt: str = "") -> str:
+    """Try to set the metronome count-in to 0, 1, 2, or 4 bars.
+
+    The Live 12.4.5 object model lists Song.count_in_duration as get/observe.
+    If Live refuses the write, the result says count_in_writable false. Use
+    pre_roll_bars on quick_record or record_loop for a timed start instead.
+    """
+    return _recording_call("set_count_in", {"bars": bars})
+
+
+@mcp.tool()
+@telemetry_tool("create_scene")
+@trajectory_tool("create_scene")
+def create_scene(
+    ctx: Context, index: int = -1, user_prompt: str = ""
+) -> str:
+    """Create a Session scene. index -1 appends. Each track gains a clip slot."""
+    return _recording_call("create_scene", {"index": index})
+
+
+@mcp.tool()
+@telemetry_tool("keep_take")
+@trajectory_tool("keep_take")
+def keep_take(
+    ctx: Context,
+    track_index: int,
+    take: Optional[int] = None,
+    clip_index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """Mark one finished take. take is 1-based among clips on the track ('keep 3').
+
+    Appends ' KEEP' to the clip name and tries to set a green clip color.
+    A clip that is still recording is not renamed.
+    """
+    if take is None and clip_index is None:
+        return "Error keep_take: take or clip_index is required"
+    params = {"track_index": track_index}
+    if take is not None:
+        params["take"] = take
+    if clip_index is not None:
+        params["clip_index"] = clip_index
+    return _recording_call("keep_take", params)
+
+
+@mcp.tool()
+@telemetry_tool("list_takes")
+@trajectory_tool("list_takes", modifying=False)
+def list_takes(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """List clips on a track with 1-based take numbers, names, and lengths."""
+    return _recording_call("list_takes", {"track_index": track_index})
 
 
 @mcp.tool()

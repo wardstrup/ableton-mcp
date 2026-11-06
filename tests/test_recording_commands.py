@@ -59,13 +59,16 @@ def make_instance(script, song=None):
 
 
 def run_now(inst, command_type, params):
-    """schedule_message stands in for Live's main thread and runs immediately."""
+    """Delay 0 runs now. Later ticks are queued so follow-ups do not recurse."""
     order = []
+    inst._deferred_for_tests = []
 
     def schedule(delay, fn):
-        assert delay == 0
-        order.append("schedule")
-        fn()
+        order.append(delay)
+        if delay == 0:
+            fn()
+        else:
+            inst._deferred_for_tests.append(fn)
 
     inst.schedule_message = schedule
     inst._schedule_order = order
@@ -296,7 +299,7 @@ def armed_song():
 def test_script_version_matches_package(script):
     from MCP_Server.remote_script_install import EXPECTED_REMOTE_SCRIPT_VERSION
 
-    assert script.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.8.1"
+    assert script.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.9.0"
     assert script.MAX_EMPTY_SLOT_RECORD_BEATS == 16384
     inst = make_instance(script)
     info = inst._process_command({"type": "get_script_info", "params": {}})
@@ -606,7 +609,7 @@ def test_empty_slot_fires_only_that_slot(script):
         "track_index": 0, "clip_index": 0, "record_length": 4,
     })
     assert response["status"] == "success"
-    assert track.clip_slots[0].fire_calls == [(4.0,)]
+    assert track.clip_slots[0].fire_calls == [(4.0, 0)]
     assert track.clip_slots[1].fire_calls == []
     assert other.arm_writes == []
     assert song.session_record is False
@@ -831,24 +834,27 @@ def test_recording_length_sentinel_is_not_reported_as_beats(script):
     assert settled["result"]["recording_slots"][0]["length"] == 4.0
 
 
-def test_stop_playback_rereads_until_transport_settles(script):
+def test_stop_playback_confirms_on_a_later_tick(script):
     class StopSong(object):
         def __init__(self):
-            self.reads = 0
+            self.stopped = False
 
         def stop_playing(self):
             self.stopped = True
 
         @property
         def is_playing(self):
-            self.reads += 1
-            return self.reads < 3
+            return not self.stopped
 
     inst = make_instance(script, StopSong())
-    result = inst._stop_playback()
+    response = run_now(inst, "stop_playback", {})
+    assert response["status"] == "success", response
+    result = response["result"]
     assert result["playing"] is False
-    assert result["pending"] is False
-    assert inst._song.reads >= 3
+    assert result["requested_playing"] is False
+    assert result["observed_playing"] is False
+    assert result["confirmed"] is True
+    assert "pending" not in result
 
 
 def test_volume_and_arm_aliases(script):
@@ -878,10 +884,9 @@ def test_record_empty_slot_warns_without_blocking(script):
         "track_index": 0, "clip_index": 0, "record_length": 4,
     })
     assert response["status"] == "success"
-    assert track.clip_slots[0].fire_calls == [(4.0,)]
+    assert track.clip_slots[0].fire_calls == [(4.0, 0)]
     text = " ".join(response["result"]["warnings"])
     assert "no available audio input" in text
-    assert "did not advance" in text
     assert response["result"]["triggered"] is True
 
 
@@ -896,15 +901,16 @@ def test_quick_record_picks_first_empty_slot_and_converts_bars(script):
     })
     assert response["status"] == "success", response
     assert response["result"]["clip_index"] == 1
-    assert track.clip_slots[1].fire_calls == [(4.0,)]
+    assert track.clip_slots[1].fire_calls == [(4.0, 0)]
     assert track.clip_slots[0].fire_calls == []
-    assert track.arm is False
+    assert track.arm is True
+    assert response["result"]["disarm_after"] == "when_take_ends"
     assert song.clip_trigger_quantization == 7
     assert response["result"]["quantization_changed"] is False
     track.clip_slots[1].has_clip = True
     blocked = run_now(inst, "quick_record", {"track_index": 0, "beats": 4})
     assert blocked["status"] == "error"
-    assert track.clip_slots[1].fire_calls == [(4.0,)]
+    assert track.clip_slots[1].fire_calls == [(4.0, 0)]
 
 
 def test_quick_arrangement_record_and_stop(script):
@@ -972,6 +978,127 @@ def test_mixer_batch_is_all_or_nothing(script):
     assert second.panning.value == 0.5
     assert second.arm is True
     assert good["result"]["tracks"][1]["error"] is None
+
+
+def test_fixed_length_stops_a_playing_slot_and_quantizes_only_this_fire(script):
+    song, track = armed_song()
+    track.clip_slots[1].is_playing = True
+    song.clip_trigger_quantization = 4
+    inst = make_instance(script, song)
+    response = run_now(inst, "record_empty_slot", {
+        "track_index": 0, "clip_index": 0, "record_length": 16,
+    })
+    assert response["status"] == "success", response
+    assert track.clip_slots[1].stop_calls == 1
+    assert track.clip_slots[0].fire_calls == [(16.0, 0)]
+    assert song.clip_trigger_quantization == 4
+
+
+def test_disarm_after_waits_until_recording_ends(script):
+    song, track = armed_song()
+    track._arm = False
+    clip = RegionClip()
+    clip.is_recording = True
+    clip.listeners = []
+
+    def add_listener(fn):
+        clip.listeners.append(fn)
+
+    clip.add_is_recording_listener = add_listener
+    inst = make_instance(script, song)
+    response = run_now(inst, "quick_record", {
+        "track_index": 0, "beats": 4, "disarm_after": True,
+    })
+    assert response["status"] == "success"
+    assert track.arm is True
+    assert inst._deferred_for_tests
+    track.clip_slots[0].has_clip = True
+    track.clip_slots[0].clip = clip
+    track.clip_slots[0].is_recording = True
+    inst._deferred_for_tests.pop(0)()
+    assert clip.listeners
+    assert track.arm is True
+    clip.is_recording = False
+    clip.listeners[0]()
+    assert track.arm is False
+
+
+def test_record_loop_chains_takes_and_discard_keeps_finished(script):
+    song, track = armed_song()
+    song.scenes = [object()]
+
+    def create_scene(index):
+        song.scenes.append(object())
+        track.clip_slots.append(Slot())
+
+    song.create_scene = create_scene
+    inst = make_instance(script, song)
+    started = run_now(inst, "record_loop", {
+        "track_index": 0, "bars": 4, "max_takes": 2,
+    })
+    assert started["status"] == "success", started
+    assert track.clip_slots[0].fire_calls == [(16.0, 0)]
+    assert track.current_monitoring_state == 1
+    # Finish take 1 and let the watcher start take 2.
+    track.clip_slots[0].has_clip = True
+    track.clip_slots[0].is_recording = True
+    inst._deferred_for_tests.pop(0)()
+    track.clip_slots[0].is_recording = False
+    inst._deferred_for_tests.pop(0)()
+    assert track.clip_slots[1].fire_calls == [(16.0, 0)]
+    finished = RegionClip()
+    finished.name = "good"
+    finished.is_recording = False
+    track.clip_slots[0].clip = finished
+    track.clip_slots[0].is_recording = False
+    track.clip_slots[1].has_clip = True
+    track.clip_slots[1].is_recording = True
+    bleeding = RegionClip()
+    bleeding.name = "bleed"
+    bleeding.is_recording = True
+    track.clip_slots[1].clip = bleeding
+    stopped = run_now(inst, "stop_record_loop", {"track_index": 0})
+    assert stopped["status"] == "success", stopped
+    assert stopped["result"]["discarded"][0]["name"] == "bleed"
+    assert track.clip_slots[1].delete_calls == 1
+    assert track.clip_slots[0].delete_calls == 0
+    assert finished.name == "good"
+
+
+def test_count_in_readonly_and_metronome_and_keep(script):
+    song, track = armed_song()
+
+    class ReadOnlyCount(object):
+        def __init__(self):
+            self.metronome = False
+            self._count = 1
+
+        @property
+        def count_in_duration(self):
+            return self._count
+
+        @count_in_duration.setter
+        def count_in_duration(self, value):
+            raise RuntimeError("read only")
+
+    readonly = ReadOnlyCount()
+    inst = make_instance(script, readonly)
+    refused = run_now(inst, "set_count_in", {"bars": 2})
+    assert refused["status"] == "success"
+    assert refused["result"]["count_in_writable"] is False
+    metro = run_now(inst, "set_metronome", {"on": True})
+    assert metro["status"] == "success"
+    assert readonly.metronome is True
+    clip = RegionClip()
+    clip.name = "vox"
+    track.clip_slots[0].has_clip = True
+    track.clip_slots[0].clip = clip
+    inst._song = song
+    listing = run_now(inst, "list_takes", {"track_index": 0})
+    assert listing["result"]["takes"][0]["take"] == 1
+    kept = run_now(inst, "keep_take", {"track_index": 0, "take": 1})
+    assert kept["status"] == "success", kept
+    assert clip.name.endswith("KEEP")
 
 
 def test_get_track_info_includes_markers(script):
