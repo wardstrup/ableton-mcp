@@ -148,6 +148,8 @@ class AbletonConnection:
             "set_arrangement_record", "set_session_record",
             "set_arrangement_overdub", "record_empty_slot", "stop_recording",
             "prepare_track", "set_clip_region",
+            "quick_record", "quick_arrangement_record",
+            "quick_arrangement_stop", "set_mixer_batch",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1034,7 +1036,7 @@ def stop_playback(ctx: Context, user_prompt: str = "") -> str:
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("stop_playback")
-        return "Stopped playback"
+        return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error stopping playback: {str(e)}")
         return f"Error stopping playback: {str(e)}"
@@ -1115,15 +1117,29 @@ def get_track_mixer_state(ctx: Context, track_index: int, user_prompt: str = "")
 @mcp.tool()
 @telemetry_tool("set_track_arm")
 @trajectory_tool("set_track_arm")
-def set_track_arm(ctx: Context, track_index: int, armed: bool, user_prompt: str = "") -> str:
+def set_track_arm(
+    ctx: Context,
+    track_index: int,
+    armed: Optional[bool] = None,
+    arm: Optional[bool] = None,
+    user_prompt: str = "",
+) -> str:
     """Set a track's arm button explicitly. This is not a toggle.
 
-    Group, return, and main tracks cannot be armed. When Live's exclusive-arm
-    preference is on, arming one track disarms the others; that preference is not changed.
+    Pass armed or arm. Group, return, and main tracks cannot be armed.
+    When Live's exclusive-arm preference is on, arming one track disarms
+    the others; that preference is not changed.
     """
-    return _recording_call(
-        "set_track_arm", {"track_index": track_index, "armed": armed}
-    )
+    if armed is None and arm is None:
+        return "Error set_track_arm: armed or arm is required"
+    if armed is not None and arm is not None and armed != arm:
+        return "Error set_track_arm: conflicting armed and arm"
+    params = {"track_index": track_index}
+    if armed is not None:
+        params["armed"] = armed
+    if arm is not None:
+        params["arm"] = arm
+    return _recording_call("set_track_arm", params)
 
 
 @mcp.tool()
@@ -1149,24 +1165,58 @@ def set_track_solo(ctx: Context, track_index: int, solo: bool, user_prompt: str 
 @mcp.tool()
 @telemetry_tool("set_track_volume")
 @trajectory_tool("set_track_volume")
-def set_track_volume(ctx: Context, track_index: int, value: float, user_prompt: str = "") -> str:
+def set_track_volume(
+    ctx: Context,
+    track_index: int,
+    value: Optional[float] = None,
+    volume: Optional[float] = None,
+    user_prompt: str = "",
+) -> str:
     """Set mixer volume in Live's raw parameter units (usually 0.0 to 1.0, not dB).
 
-    Values outside the parameter's own min/max are rejected and the volume is left unchanged.
+    Pass value or volume. Values outside the parameter's own min/max are rejected
+    and the volume is left unchanged.
     """
-    return _recording_call(
-        "set_track_volume", {"track_index": track_index, "value": value}
-    )
+    if value is None and volume is None:
+        return "Error set_track_volume: value or volume is required"
+    if value is not None and volume is not None and value != volume:
+        return "Error set_track_volume: conflicting value and volume"
+    params = {"track_index": track_index}
+    if value is not None:
+        params["value"] = value
+    if volume is not None:
+        params["volume"] = volume
+    return _recording_call("set_track_volume", params)
 
 
 @mcp.tool()
 @telemetry_tool("set_track_panning")
 @trajectory_tool("set_track_panning")
-def set_track_panning(ctx: Context, track_index: int, value: float, user_prompt: str = "") -> str:
-    """Set mixer pan in Live's raw parameter units (usually -1.0 left to 1.0 right)."""
-    return _recording_call(
-        "set_track_panning", {"track_index": track_index, "value": value}
-    )
+def set_track_panning(
+    ctx: Context,
+    track_index: int,
+    value: Optional[float] = None,
+    panning: Optional[float] = None,
+    pan: Optional[float] = None,
+    user_prompt: str = "",
+) -> str:
+    """Set mixer pan in Live's raw parameter units (usually -1.0 left to 1.0 right).
+
+    Pass value, panning, or pan.
+    """
+    sent = [item for item in (value, panning, pan) if item is not None]
+    if not sent:
+        return "Error set_track_panning: value, panning, or pan is required"
+    if any(item != sent[0] for item in sent[1:]):
+        return "Error set_track_panning: conflicting pan values"
+    params = {"track_index": track_index}
+    if value is not None:
+        params["value"] = value
+    if panning is not None:
+        params["panning"] = panning
+    if pan is not None:
+        params["pan"] = pan
+    return _recording_call("set_track_panning", params)
 
 
 @mcp.tool()
@@ -1241,20 +1291,27 @@ def set_track_input_routing(
 @trajectory_tool("set_arrangement_record")
 def set_arrangement_record(
     ctx: Context,
-    enabled: bool,
+    enabled: Optional[bool] = None,
+    on: Optional[bool] = None,
     allow_overwrite: bool = False,
     user_prompt: str = "",
 ) -> str:
     """Set the arrangement record button explicitly. This does not start or stop playback.
 
-    Enabling is refused when an armed track has an arrangement clip under the
-    playhead, unless allow_overwrite is true. Turning it off keeps the recorded
-    arrangement audio and does not delete anything.
+    Pass enabled or on. Enabling is refused when an armed track has an
+    arrangement clip under the playhead, unless allow_overwrite is true.
+    Turning it off keeps the recorded arrangement audio and does not delete anything.
     """
-    return _recording_call(
-        "set_arrangement_record",
-        {"enabled": enabled, "allow_overwrite": allow_overwrite},
-    )
+    if enabled is None and on is None:
+        return "Error set_arrangement_record: enabled or on is required"
+    if enabled is not None and on is not None and enabled != on:
+        return "Error set_arrangement_record: conflicting enabled and on"
+    params = {"allow_overwrite": allow_overwrite}
+    if enabled is not None:
+        params["enabled"] = enabled
+    if on is not None:
+        params["on"] = on
+    return _recording_call("set_arrangement_record", params)
 
 
 @mcp.tool()
@@ -1262,7 +1319,8 @@ def set_arrangement_record(
 @trajectory_tool("set_session_record")
 def set_session_record(
     ctx: Context,
-    enabled: bool,
+    enabled: Optional[bool] = None,
+    on: Optional[bool] = None,
     allow_overwrite: bool = False,
     user_prompt: str = "",
 ) -> str:
@@ -1273,23 +1331,42 @@ def set_session_record(
     allow_overwrite is true. To record one empty slot, use record_empty_slot
     instead. Turning this off does not delete clips and does not stop playback.
     """
-    return _recording_call(
-        "set_session_record",
-        {"enabled": enabled, "allow_overwrite": allow_overwrite},
-    )
+    if enabled is None and on is None:
+        return "Error set_session_record: enabled or on is required"
+    if enabled is not None and on is not None and enabled != on:
+        return "Error set_session_record: conflicting enabled and on"
+    params = {"allow_overwrite": allow_overwrite}
+    if enabled is not None:
+        params["enabled"] = enabled
+    if on is not None:
+        params["on"] = on
+    return _recording_call("set_session_record", params)
 
 
 @mcp.tool()
 @telemetry_tool("set_arrangement_overdub")
 @trajectory_tool("set_arrangement_overdub")
 def set_arrangement_overdub(
-    ctx: Context, enabled: bool, user_prompt: str = ""
+    ctx: Context,
+    enabled: Optional[bool] = None,
+    on: Optional[bool] = None,
+    user_prompt: str = "",
 ) -> str:
-    """Set MIDI arrangement overdub explicitly. This does not start recording.
+    """Set MIDI arrangement overdub explicitly. Pass enabled or on.
 
-    Song.overdub is a legacy alias of session record and is not set by this tool.
+    This does not start recording. Song.overdub is a legacy alias of session
+    record and is not set by this tool.
     """
-    return _recording_call("set_arrangement_overdub", {"enabled": enabled})
+    if enabled is None and on is None:
+        return "Error set_arrangement_overdub: enabled or on is required"
+    if enabled is not None and on is not None and enabled != on:
+        return "Error set_arrangement_overdub: conflicting enabled and on"
+    params = {}
+    if enabled is not None:
+        params["enabled"] = enabled
+    if on is not None:
+        params["on"] = on
+    return _recording_call("set_arrangement_overdub", params)
 
 
 @mcp.tool()
@@ -1445,9 +1522,11 @@ def set_clip_region(
 ) -> str:
     """Move a clip's start/end markers or loop. This does not crop or replace the source file.
 
-    end_marker must stay greater than start_marker, and the loop must stay inside
-    those markers. Unwarped audio cannot be set to looping. A clip that is currently
-    recording is left unchanged. view is session or arrangement.
+    end_marker must stay greater than start_marker. If you send only markers,
+    the existing loop is clamped inside them. An explicit loop that falls
+    outside the markers is rejected and nothing is written. This does not crop.
+    Unwarped audio cannot be set to looping. A clip that is recording is left
+    unchanged. view is session or arrangement.
     """
     if view not in _CLIP_VIEWS:
         return "Error set_clip_region: view must be session or arrangement"
@@ -1470,6 +1549,121 @@ def set_clip_region(
             "loop_start, loop_end, looping"
         )
     return _recording_call("set_clip_region", params)
+
+
+@mcp.tool()
+@telemetry_tool("quick_record")
+@trajectory_tool("quick_record")
+def quick_record(
+    ctx: Context,
+    track_index: int,
+    beats: Optional[float] = None,
+    bars: Optional[float] = None,
+    slot_index: Optional[int] = None,
+    arm: bool = True,
+    monitoring: Optional[str] = None,
+    input_routing_type: Optional[str] = None,
+    input_routing_channel: Optional[str] = None,
+    disarm_after: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """Arm if needed, pick an empty Session slot, and fire it for a fixed length.
+
+    Pass bars or beats, not both. slot_index defaults to the first empty slot.
+    Launch quantization is left untouched. The call returns when Live accepts
+    the fire, not when the take finishes. disarm_after drops arm after the fire.
+    Missing audio input or a stuck playhead is reported in warnings and does not block.
+    """
+    if monitoring is not None and (
+        not isinstance(monitoring, str) or monitoring.strip().lower() not in _MONITORING_NAMES
+    ):
+        return "Error quick_record: monitoring must be one of in, auto, off"
+    if (beats is None) == (bars is None):
+        return "Error quick_record: pass bars or beats, not both and not neither"
+    length_error = _reject_record_length(beats) if beats is not None else None
+    if length_error:
+        return f"Error quick_record: {length_error}"
+    if bars is not None and (isinstance(bars, bool) or not isinstance(bars, (int, float)) or bars <= 0):
+        return "Error quick_record: bars must be a positive number"
+    params = _omit_none({
+        "track_index": track_index,
+        "beats": beats,
+        "bars": bars,
+        "slot_index": slot_index,
+        "arm": arm,
+        "monitoring": None if monitoring is None else monitoring.strip().lower(),
+        "input_routing_type": input_routing_type,
+        "input_routing_channel": input_routing_channel,
+        "disarm_after": disarm_after,
+    })
+    return _recording_call("quick_record", params)
+
+
+@mcp.tool()
+@telemetry_tool("quick_arrangement_record")
+@trajectory_tool("quick_arrangement_record")
+def quick_arrangement_record(
+    ctx: Context,
+    track_indexes: List[int],
+    start_time: Optional[float] = None,
+    arm: bool = True,
+    allow_overwrite: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """Arm the tracks, seek, enable arrangement record, and start playback in one call.
+
+    Refuses, with no writes, when a listed track has an arrangement clip covering
+    the record position, unless allow_overwrite is true. Launch quantization is not changed.
+    """
+    if not isinstance(track_indexes, list) or not track_indexes:
+        return "Error quick_arrangement_record: track_indexes must be a non-empty list"
+    params = {
+        "track_indexes": track_indexes,
+        "arm": arm,
+        "allow_overwrite": allow_overwrite,
+    }
+    if start_time is not None:
+        params["start_time"] = start_time
+    return _recording_call("quick_arrangement_record", params)
+
+
+@mcp.tool()
+@telemetry_tool("quick_arrangement_stop")
+@trajectory_tool("quick_arrangement_stop")
+def quick_arrangement_stop(
+    ctx: Context,
+    track_indexes: Optional[List[int]] = None,
+    disarm: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """Stop playback, turn arrangement record off, and optionally disarm.
+
+    Clips are not deleted. With disarm and no track_indexes, every currently
+    armed track is disarmed. playing may be pending if Live has not settled yet.
+    """
+    params = {"disarm": disarm}
+    if track_indexes is not None:
+        params["track_indexes"] = track_indexes
+    return _recording_call("quick_arrangement_stop", params)
+
+
+@mcp.tool()
+@telemetry_tool("set_mixer_batch")
+@trajectory_tool("set_mixer_batch")
+def set_mixer_batch(
+    ctx: Context,
+    tracks: List[Dict[str, Any]],
+    user_prompt: str = "",
+) -> str:
+    """Set volume, pan, mute, solo, arm, and sends for several tracks in one call.
+
+    Each item needs track_index and any of volume (or value), pan (or panning),
+    mute, solo, arm (or armed), and sends. One invalid item changes nothing.
+    Results are per track.
+    """
+    if not isinstance(tracks, list):
+        return "Error set_mixer_batch: tracks must be a list"
+    return _recording_call("set_mixer_batch", {"tracks": tracks})
 
 
 @mcp.tool()

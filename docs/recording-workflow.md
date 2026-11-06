@@ -1,6 +1,20 @@
 # Recording workflow commands
 
-Remote Script `1.8.0` on top of installed base `9dddc7bd5b95412510fdeb745949e3bf23f3fd8a` (script `1.7.1`). These commands are in the Live Remote Script and the MCP server. They are not installed into Joe's Live, and they have not been run against a live set.
+Remote Script `1.8.1`. Parent install was `9dddc7bd5b95412510fdeb745949e3bf23f3fd8a` (script `1.7.1`). `1.8.0` was loaded in Live 12 Suite and the passing checks are noted below. `1.8.1` is the follow-up for the failures from that session. It has mock tests only until it is copied in again.
+
+The socket stays on loopback. Nothing here waits for a take to finish, crops a clip, or replaces a sample file. A reply is not a real-time acknowledgement. Observed round trips on that Mac were about 300–800 ms.
+
+## Live 12 Suite results for 1.8.0
+
+Passed there: `get_script_info` 1.8.0, arm, mute, solo, volume, pan, monitoring, input routing, `record_empty_slot` with `record_length` 4 (fire about 620 ms, clip length 4.0 kept), `stop_recording` slot, arrangement record, `session_record`, and `arrangement_overdub`.
+
+`1.8.1` changes from that session:
+
+- `set_clip_region` with only `start_marker` or `end_marker` clamps `loop_start` / `loop_end` inside the new markers. An explicit loop that does not fit is still rejected. `crop` is still never called.
+- While `is_recording` is true, a length above 100000 (Live briefly reported about 63072000, which is sample frames rather than beats) is returned as `length: null` and `length_status: "recording"`. A settled beat length is returned as beats.
+- `stop_playback` re-reads `is_playing` on the main thread and returns `pending: true` if Live has not settled.
+- Discrete setters accept the same names as `prepare_track`: `volume` or `value`, `panning` or `pan` or `value`, `arm` or `armed`, `enabled` or `on`.
+- `record_empty_slot` and `get_recording_state` add `warnings` when the track has no available audio input, or `is_playing` is true and `current_song_time` does not move across a short re-read. They still fire or return state. That matches a session with no audio input device, where Ext. In disappeared, the slot reported triggered, and no clip was created.
 
 The socket stays on loopback. Nothing here waits for audio, crops a clip, or replaces a sample file.
 
@@ -20,7 +34,11 @@ The socket stays on loopback. Nothing here waits for audio, crops a clip, or rep
 | `record_empty_slot` | `Track.arm` if requested, then `ClipSlot.fire` | Global session record. Occupied slots. Unarmed fire (that would hit the track stop button). |
 | `stop_recording` | See scopes below | Deleting clips. `Song.stop_playing`. |
 | `get_recording_state` / `get_track_mixer_state` | Reads | Writes. |
-| `get_clip_region` / `set_clip_region` | `start_marker`, `end_marker`, `loop_start`, `loop_end`, `looping` | `Clip.crop`. Replacing `file_path`. |
+| `get_clip_region` / `set_clip_region` | `start_marker`, `end_marker`, `loop_start`, `loop_end`, `looping` | `Clip.crop`. Replacing `file_path`. Marker-only edits clamp the loop. |
+| `quick_record` | arm if needed, first empty slot or `slot_index`, `ClipSlot.fire(beats)` | Launch quantization. Occupied slots. Does not wait for the take. |
+| `quick_arrangement_record` | arm, optional seek, `record_mode`, `start_playing` | Quantization. Overlapping arrangement clips unless `allow_overwrite`. |
+| `quick_arrangement_stop` | `stop_playing`, `record_mode` false, optional disarm | Deleting clips. |
+| `set_mixer_batch` | volume, pan, mute, solo, arm, sends for many tracks | Partial writes. One bad item changes nothing. |
 
 `stop_recording` scopes:
 
@@ -62,6 +80,21 @@ The socket stays on loopback. Nothing here waits for audio, crops a clip, or rep
 
 ```json
 {"type": "stop_recording", "params": {"scope": "slot", "track_index": 0, "clip_index": 0}}
+```
+
+```json
+{"type": "quick_record", "params": {"track_index": 0, "bars": 1, "arm": true}}
+```
+
+```json
+{"type": "set_track_volume", "params": {"track_index": 0, "volume": 0.85}}
+```
+
+```json
+{"type": "set_mixer_batch", "params": {"tracks": [
+  {"track_index": 0, "volume": 0.85, "pan": 0.0, "mute": false},
+  {"track_index": 1, "arm": true}
+]}}
 ```
 
 ```json

@@ -1,6 +1,6 @@
 # AbletonMCP capability survey
 
-Date of this survey: 2026-11-06. No connection was opened to the Mac that is running Live. Nothing here was executed inside Live 12 Suite.
+Date of this survey: 2026-11-06. The original comparison did not connect to Live. After that, Joe installed script 1.8.0 and tested it in Live 12 Suite. Those results are in [recording-workflow.md](recording-workflow.md). Script 1.8.1 is the follow-up for the failures (loop clamp, recording length, stale stop, parameter aliases, non-blocking input/transport warnings, and the snappy commands). 1.8.1 itself has not been loaded into Live yet.
 
 Machine-readable rows: [capability-audit.json](capability-audit.json).
 

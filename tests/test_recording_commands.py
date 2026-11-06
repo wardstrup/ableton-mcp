@@ -143,6 +143,7 @@ class Track(object):
             "Ext. In": [Routing("1"), Routing("2")],
             "Resampling": [Routing("Pre FX"), Routing("Post FX")],
         }
+        self.no_inputs = False
         self.volume = Param(0.85)
         self.panning = Param(0.0, -1.0, 1.0)
         self.sends = [Param(0.0), Param(0.25)]
@@ -168,6 +169,8 @@ class Track(object):
 
     @property
     def available_input_routing_types(self):
+        if self.no_inputs:
+            return []
         return [Routing("Ext. In"), Routing("Resampling"), Routing("No Input")]
 
     @property
@@ -293,7 +296,7 @@ def armed_song():
 def test_script_version_matches_package(script):
     from MCP_Server.remote_script_install import EXPECTED_REMOTE_SCRIPT_VERSION
 
-    assert script.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.8.0"
+    assert script.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.8.1"
     assert script.MAX_EMPTY_SLOT_RECORD_BEATS == 16384
     inst = make_instance(script)
     info = inst._process_command({"type": "get_script_info", "params": {}})
@@ -759,7 +762,9 @@ def test_get_recording_state_reports_count_in_without_writing(script):
     assert result["count_in_label"] == "1_bar"
     assert result["limitations"]["count_in_writable"] is False
     assert result["session_record_status"] == "off"
-    assert result["recording_slots"] == [{"track_index": 0, "clip_index": 0}]
+    assert result["recording_slots"][0]["track_index"] == 0
+    assert result["recording_slots"][0]["clip_index"] == 0
+    assert result["recording_slots"][0]["length_status"] == "recording"
     assert song.flag_writes == []
     assert result["limitations"]["uses_trigger_session_record"] is False
 
@@ -773,6 +778,200 @@ def test_get_session_info_stays_readable_without_new_song_attrs(script):
     assert result["tempo"] == 120.0
     assert result["record_mode"] is False
     assert result["count_in_duration"] == 1
+
+
+def test_start_marker_alone_clamps_loop_and_never_crops(script):
+    song, track = armed_song()
+    clip = RegionClip()
+    clip._v["looping"] = True
+    track.clip_slots[0].has_clip = True
+    track.clip_slots[0].clip = clip
+    inst = make_instance(script, song)
+    response = run_now(inst, "set_clip_region", {
+        "track_index": 0, "clip_index": 0, "start_marker": 2.0,
+    })
+    assert response["status"] == "success", response
+    assert clip.start_marker == 2.0
+    assert clip.end_marker == 8.0
+    assert clip.loop_start == 2.0
+    assert clip.loop_end == 8.0
+    assert clip.crop_calls == 0
+    assert response["result"]["loop_adjusted"] is True
+    assert response["result"]["loop_start"] == 2.0
+    clip.writes = []
+    refused = run_now(inst, "set_clip_region", {
+        "track_index": 0, "clip_index": 0, "start_marker": 3.0, "loop_start": 0.0,
+    })
+    assert refused["status"] == "error"
+    assert clip.writes == []
+    assert clip.crop_calls == 0
+
+
+def test_recording_length_sentinel_is_not_reported_as_beats(script):
+    song, track = armed_song()
+    clip = RegionClip()
+    clip.length = 63072000.0
+    clip.is_recording = True
+    track.clip_slots[0].has_clip = True
+    track.clip_slots[0].clip = clip
+    track.clip_slots[0].is_recording = True
+    track.devices = []
+    inst = make_instance(script, song)
+    response = run_now(inst, "get_recording_state", {})
+    assert response["status"] == "success"
+    slot = response["result"]["recording_slots"][0]
+    assert slot["length"] is None
+    assert slot["length_status"] == "recording"
+    assert slot["length_raw"] == 63072000.0
+    info = inst._get_track_info(0)
+    assert info["clip_slots"][0]["clip"]["length"] is None
+    assert info["clip_slots"][0]["clip"]["length_status"] == "recording"
+    clip.length = 4.0
+    settled = run_now(inst, "get_recording_state", {})
+    assert settled["result"]["recording_slots"][0]["length"] == 4.0
+
+
+def test_stop_playback_rereads_until_transport_settles(script):
+    class StopSong(object):
+        def __init__(self):
+            self.reads = 0
+
+        def stop_playing(self):
+            self.stopped = True
+
+        @property
+        def is_playing(self):
+            self.reads += 1
+            return self.reads < 3
+
+    inst = make_instance(script, StopSong())
+    result = inst._stop_playback()
+    assert result["playing"] is False
+    assert result["pending"] is False
+    assert inst._song.reads >= 3
+
+
+def test_volume_and_arm_aliases(script):
+    song, track = armed_song()
+    inst = make_instance(script, song)
+    volume = run_now(inst, "set_track_volume", {"track_index": 0, "volume": 0.4})
+    assert volume["status"] == "success"
+    assert track.volume.value == 0.4
+    pan = run_now(inst, "set_track_panning", {"track_index": 0, "pan": -0.25})
+    assert pan["status"] == "success"
+    assert track.panning.value == -0.25
+    arm = run_now(inst, "set_track_arm", {"track_index": 0, "arm": False})
+    assert arm["status"] == "success"
+    assert track.arm is False
+    conflict = run_now(inst, "set_track_volume", {
+        "track_index": 0, "value": 0.2, "volume": 0.3,
+    })
+    assert conflict["status"] == "error"
+    assert track.volume.value == 0.4
+
+
+def test_record_empty_slot_warns_without_blocking(script):
+    song, track = armed_song()
+    track.no_inputs = True
+    inst = make_instance(script, song)
+    response = run_now(inst, "record_empty_slot", {
+        "track_index": 0, "clip_index": 0, "record_length": 4,
+    })
+    assert response["status"] == "success"
+    assert track.clip_slots[0].fire_calls == [(4.0,)]
+    text = " ".join(response["result"]["warnings"])
+    assert "no available audio input" in text
+    assert "did not advance" in text
+    assert response["result"]["triggered"] is True
+
+
+def test_quick_record_picks_first_empty_slot_and_converts_bars(script):
+    song, track = armed_song()
+    track._arm = False
+    track.clip_slots[0].has_clip = True
+    song.clip_trigger_quantization = 7
+    inst = make_instance(script, song)
+    response = run_now(inst, "quick_record", {
+        "track_index": 0, "bars": 1, "monitoring": "auto", "disarm_after": True,
+    })
+    assert response["status"] == "success", response
+    assert response["result"]["clip_index"] == 1
+    assert track.clip_slots[1].fire_calls == [(4.0,)]
+    assert track.clip_slots[0].fire_calls == []
+    assert track.arm is False
+    assert song.clip_trigger_quantization == 7
+    assert response["result"]["quantization_changed"] is False
+    track.clip_slots[1].has_clip = True
+    blocked = run_now(inst, "quick_record", {"track_index": 0, "beats": 4})
+    assert blocked["status"] == "error"
+    assert track.clip_slots[1].fire_calls == [(4.0,)]
+
+
+def test_quick_arrangement_record_and_stop(script):
+    song, track = armed_song()
+    track._arm = False
+    track.arrangement_clips = [ArrClip(0.0, 4.0)]
+    song.current_song_time = 1.0
+    song.clip_trigger_quantization = 7
+    song.started = False
+
+    def start_playing():
+        song.started = True
+
+    def stop_playing():
+        song._flags["is_playing"] = False
+
+    song.start_playing = start_playing
+    song.stop_playing = stop_playing
+    inst = make_instance(script, song)
+    refused = run_now(inst, "quick_arrangement_record", {
+        "track_indexes": [0], "arm": True,
+    })
+    assert refused["status"] == "error"
+    assert track.arm_writes == []
+    assert song.started is False
+    assert song.record_mode is False
+    track.arrangement_clips = []
+    ok = run_now(inst, "quick_arrangement_record", {
+        "track_indexes": [0], "start_time": 8, "arm": True,
+    })
+    assert ok["status"] == "success", ok
+    assert track.arm is True
+    assert song.current_song_time == 8
+    assert song.record_mode is True
+    assert song.started is True
+    assert song.clip_trigger_quantization == 7
+    stopped = run_now(inst, "quick_arrangement_stop", {
+        "track_indexes": [0], "disarm": True,
+    })
+    assert stopped["status"] == "success", stopped
+    assert song.record_mode is False
+    assert track.arm is False
+    assert stopped["result"]["deleted"] is False
+
+
+def test_mixer_batch_is_all_or_nothing(script):
+    song, first = armed_song()
+    second = Track(name="B", armed=False)
+    song.tracks = [first, second]
+    inst = make_instance(script, song)
+    bad = run_now(inst, "set_mixer_batch", {"tracks": [
+        {"track_index": 0, "volume": 0.2},
+        {"track_index": 1, "volume": 4},
+    ]})
+    assert bad["status"] == "error"
+    assert first.volume.writes == 0
+    assert second.volume.writes == 0
+    good = run_now(inst, "set_mixer_batch", {"tracks": [
+        {"track_index": 0, "volume": 0.2, "mute": True},
+        {"track_index": 1, "pan": 0.5, "arm": True},
+    ]})
+    assert good["status"] == "success", good
+    assert first.volume.value == 0.2
+    assert first.mute is True
+    assert second.panning.value == 0.5
+    assert second.arm is True
+    assert good["result"]["tracks"][1]["error"] is None
 
 
 def test_get_track_info_includes_markers(script):

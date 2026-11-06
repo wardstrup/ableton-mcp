@@ -134,6 +134,37 @@ def test_empty_routing_is_not_sent(monkeypatch):
     assert result.startswith("Error set_track_input_routing")
 
 
+def test_volume_alias_is_forwarded(fake_conn):
+    call(server.set_track_volume, None, track_index=0, volume=0.4)
+    assert fake_conn.sent == [("set_track_volume", {"track_index": 0, "volume": 0.4})]
+
+
+def test_quick_record_forwards_one_length(fake_conn):
+    call(server.quick_record, None, track_index=2, bars=2, monitoring="in")
+    command, params = fake_conn.sent[0]
+    assert command == "quick_record"
+    assert params["track_index"] == 2
+    assert params["bars"] == 2
+    assert params["monitoring"] == "in"
+    assert "beats" not in params
+    assert "launch_quantization" not in params
+
+
+def test_quick_record_rejects_both_lengths(monkeypatch):
+    def boom():
+        raise AssertionError("should not connect")
+
+    monkeypatch.setattr(server, "get_ableton_connection", boom)
+    result = call(server.quick_record, None, track_index=0, bars=1, beats=4)
+    assert result.startswith("Error quick_record")
+
+
+def test_mixer_batch_forwards_the_list(fake_conn):
+    tracks = [{"track_index": 0, "volume": 0.5, "pan": 0.0}]
+    call(server.set_mixer_batch, None, tracks=tracks)
+    assert fake_conn.sent == [("set_mixer_batch", {"tracks": tracks})]
+
+
 def test_clip_region_requires_a_field(monkeypatch):
     def boom():
         raise AssertionError("should not connect")
