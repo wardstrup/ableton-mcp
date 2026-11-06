@@ -1,0 +1,14 @@
+{
+  "ableton_host": "127.0.0.1",
+  "ableton_port": 9877,
+  "command_timeout": 1.5,
+  "words_file": "words.json",
+  "log_file": "voice-trigger.log",
+  "vosk_model": "model",
+  "sample_rate": 16000,
+  "input_device": null,
+  "tone_output_device": null,
+  "loopback_output_device": null,
+  "min_confidence": 0.65,
+  "debounce_sec": 0.45
+}

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Not installed by this repo. LaunchAgent does not expand ~.
+  Replace USERNAME, then:
+    cp voice_trigger/com.grok.music-voice-trigger.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.grok.music-voice-trigger.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.grok.music-voice-trigger</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/USERNAME/Grok/Music/voice-trigger</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/Grok/Music/voice-trigger/.venv/bin/python</string>
+    <string>-m</string>
+    <string>voice_trigger</string>
+    <string>--config</string>
+    <string>/Users/USERNAME/Grok/Music/voice-trigger/config.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>
