@@ -299,7 +299,7 @@ def armed_song():
 def test_script_version_matches_package(script):
     from MCP_Server.remote_script_install import EXPECTED_REMOTE_SCRIPT_VERSION
 
-    assert script.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.9.0"
+    assert script.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "2.0.0"
     assert script.MAX_EMPTY_SLOT_RECORD_BEATS == 16384
     inst = make_instance(script)
     info = inst._process_command({"type": "get_script_info", "params": {}})
@@ -1099,6 +1099,97 @@ def test_count_in_readonly_and_metronome_and_keep(script):
     kept = run_now(inst, "keep_take", {"track_index": 0, "take": 1})
     assert kept["status"] == "success", kept
     assert clip.name.endswith("KEEP")
+
+
+def test_take_defaults_and_named_arm_and_take_lanes(script):
+    song, keys = armed_song()
+    keys.name = "Keys"
+    keys._arm = False
+    guitar = Track(name="Guitar", armed=False)
+    other = Track(name="Drums", armed=True)
+    song.tracks = [keys, guitar, other]
+    inst = make_instance(script, song)
+    armed = run_now(inst, "arm_tracks", {"names": ["keys", "guitar"]})
+    assert armed["status"] == "success", armed
+    assert keys.arm is True
+    assert guitar.arm is True
+    assert other.arm is False
+    assert keys.current_monitoring_state == 1
+    take = run_now(inst, "take", {})
+    assert take["status"] == "success", take
+    assert take["result"]["bars"] == 8
+    assert take["result"]["beats"] == 32.0
+    assert take["result"]["view"] == "session"
+    assert take["result"]["count_in"]["path"] == "count_in_duration"
+    assert keys.clip_slots[0].fire_calls == [(32.0, 0)]
+    assert guitar.clip_slots[0].fire_calls == [(32.0, 0)]
+    state = run_now(inst, "get_performance_state", {})
+    assert state["result"]["tempo"] == 120.0
+    assert len(state["result"]["armed_tracks"]) == 2
+    lane = type("Lane", (), {"name": "Pass 1", "arrangement_clips": []})()
+    keys.take_lanes = [lane]
+    listed = run_now(inst, "list_take_lanes", {"name": "Keys"})
+    assert listed["result"]["supported"] is True
+    assert listed["result"]["delete_supported"] is False
+    assert listed["result"]["activate_supported"] is False
+    labeled = run_now(inst, "label_take_lane", {"name": "Keys"})
+    assert labeled["result"]["name"].endswith("KEEP")
+    removed = run_now(inst, "delete_take_lane", {"name": "Keys"})
+    assert removed["result"]["deleted"] is False
+    assert removed["result"]["delete_supported"] is False
+
+
+def test_arrangement_take_uses_loop_brace(script):
+    song, track = armed_song()
+    song.loop = False
+    song.loop_start = 0.0
+    song.loop_length = 4.0
+    song.punch_in = False
+    song.punch_out = False
+    inst = make_instance(script, song)
+    view = types.SimpleNamespace(focused_document_view="Session")
+
+    def show_view(name):
+        view.focused_document_view = name
+
+    view.show_view = show_view
+    view.focus_view = show_view
+    inst.application = lambda: types.SimpleNamespace(view=view)
+    result = run_now(inst, "take", {"view": "arrangement"})
+    assert result["status"] == "success", result
+    assert result["result"]["view"] == "arrangement"
+    assert song.loop_start == song.current_song_time
+    assert song.loop_length == 32.0
+    assert song.loop is False
+    assert song.punch_in is True and song.punch_out is True
+    assert song.record_mode is True
+    assert track.clip_slots[0].fire_calls == []
+    looped = run_now(inst, "take", {"view": "arrangement", "loop": True, "count_in": False})
+    assert looped["status"] == "success", looped
+    assert song.loop is True
+    assert song.punch_in is False and song.punch_out is False
+
+
+def test_take_count_in_falls_back_to_pre_roll(script):
+    class LockedSong(Song):
+        def __setattr__(self, name, value):
+            if name == "count_in_duration" and getattr(self, "_lock_count", False):
+                raise RuntimeError("read only")
+            Song.__setattr__(self, name, value)
+
+    song = LockedSong()
+    track = Track(name="Keys", armed=True)
+    song.tracks = [track]
+    song.scenes = [object()]
+    song._lock_count = True
+    inst = make_instance(script, song)
+    result = run_now(inst, "take", {})
+    assert result["status"] == "success", result
+    assert result["result"]["count_in"]["path"] == "pre_roll"
+    assert track.clip_slots[0].fire_calls == []
+    song.current_song_time = 20.0
+    inst._deferred_for_tests[0]()
+    assert track.clip_slots[0].fire_calls == [(32.0, 0)]
 
 
 def test_get_track_info_includes_markers(script):

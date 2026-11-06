@@ -64,6 +64,20 @@ MODIFYING_TOOLS = {
     "set_count_in",
     "create_scene",
     "keep_take",
+    "show_view",
+    "arm_tracks",
+    "take",
+    "again",
+    "scrap",
+    "cancel",
+    "play_transport",
+    "pause_transport",
+    "nudge_tempo",
+    "mark_playhead",
+    "label_take_lane",
+    "delete_take_lane",
+    "stop_performance",
+    "keep_last",
 }
 
 _PARAM_KEYS = (
@@ -127,6 +141,12 @@ _PARAM_KEYS = (
     "pre_roll_bars",
     "discard_current",
     "take",
+    "loop",
+    "count_in",
+    "exclusive",
+    "names",
+    "delta",
+    "label",
 )
 
 # A `path` ending in one of these is a file on disk, not a Live browser category.

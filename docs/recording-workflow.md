@@ -1,6 +1,6 @@
 # Recording workflow commands
 
-Remote Script `1.9.0`. `1.8.1` is what is installed and was tested on Live 12.4.16. `1.9.0` is not loaded yet.
+Remote Script `2.0.0`. `1.9.0` is the last script on this branch before this round. It is not loaded in Live until Joe copies it. See [install-rollback.md](install-rollback.md). The voice trigger is [voice_trigger/README.md](../voice_trigger/README.md).
 
 The socket stays on loopback. Nothing here waits for a take to finish, crops a clip, or replaces a sample file. A reply is not a real-time acknowledgement. Observed round trips on that Mac were about 300–800 ms.
 
@@ -21,6 +21,16 @@ Passed there: `get_script_info` 1.8.0, arm, mute, solo, volume, pan, monitoring,
 - `create_scene`, and `quick_record` `create_scene_if_full`.
 - Arming in `quick_record`, `record_loop`, and `prepare_track` (when arm is set true) sets monitoring to auto unless `monitoring` is `keep` or another explicit value.
 - `keep_take` (1-based `take`, as in "keep 3") appends ` KEEP` and tries a green color. `list_takes` lists clips with lengths.
+
+`2.0.0` is the voice-performance layer on top of that. It does not move clips.
+
+- A take is 8 bars unless `bars` is sent. Count-in defaults to 1 bar. The reply's `count_in.path` is `count_in_duration` when `Song.count_in_duration` accepts the write and the readback matches, and `pre_roll` when it does not. Pre-roll is the 1.9.0 path: metronome on, then fire after one bar, without sleeping on the main thread.
+- `show_view` uses `Application.view.show_view` with `Session` or `Arranger`. A take with no `view` follows `focused_document_view`.
+- Session takes share one empty scene row across every armed track and create a scene when that row does not exist. Arrangement takes set `loop_start` and `loop_length` from the playhead, or from the existing loop start when the loop is already on. `loop: true` leaves the brace looping and punch off, so Live's own comping can open a take lane per pass. A one-shot sets punch-in and punch-out on that brace and does not leave the loop on. The script cannot create those lanes itself.
+- Take lanes: Live 12.4.5 `TakeLane` can be listed (`arrangement_clips`, `name`) and renamed. `Track.create_take_lane`, `create_audio_clip`, and `create_midi_clip` exist. There is no activate member and no delete member. `list_take_lanes` reports `activate_supported: false`. `delete_take_lane` calls `track.delete_take_lane` or `lane.delete` only when that callable is actually present; otherwise `delete_supported` is false and nothing is deleted. `label_take_lane` appends ` KEEP` to the last lane by default.
+- `arm_tracks` arms by name. Exclusive is the default and disarms the others. `"keys and guitar"` is two names in one call. Monitoring becomes auto unless `monitoring` is `keep` or another value. One `take` records every armed track.
+- `again` deletes the last take and starts another. `scrap` deletes the last finished take and leaves a take that is still recording. `cancel` stops transport and recording and deletes only the take that is recording. `stop_performance` stops recording and deletes that same in-progress take, and leaves playback running. `play_transport` and `pause_transport` do not delete. `nudge_tempo` adds a delta (5 or -5) and clamps to 20–999. `mark_playhead` uses `set_or_delete_cue` at the current time and does not move the playhead. `keep_last` only appends ` KEEP`.
+- `get_performance_state` returns view, armed tracks, whether something is recording, the last take, tempo, and metronome.
 
 `1.8.1` changes, already Live-tested:
 
@@ -127,7 +137,7 @@ Volume `0.85` is Live's raw unity-ish parameter value, not 0 dB by name. Read `g
 
 ## Limits, stated from the docs
 
-- Count-in is `Song.count_in_duration`, get/observe only in the Live 12.4.5 Max Live Object Model (0 none, 1 one bar, 2 two bars, 3 four bars). This script reports it and does not set it. `is_counting_in` is also only read.
+- Count-in is `Song.count_in_duration`, get/observe only in the Live 12.4.5 Max Live Object Model (0 none, 1 one bar, 2 two bars, 3 four bars). `set_count_in` and `take` try the write. When Live rejects it or the readback does not match, the reply says so and the take uses pre-roll instead. `is_counting_in` is only read.
 - Fixed length is `ClipSlot.fire(record_length)` on that empty slot. The official ClipSlot page says a passed length records for that many beats and raises if the slot already owns a clip. There is no separate "record N bars on the arrangement" command.
 - `Song.trigger_session_record` is not called. The same page says a second call stops recording and starts playback, so it is not an idempotent setter.
 - The official Max text calls `Song.session_record` the Session Overdub button and says read-only `session_record_status` reflects the Session Record button. Non-official Live 12 Python stubs describe `session_record` as the session record state. `set_session_record` writes `Song.session_record`. Which on-screen button moves has to be checked in Live 12 Suite before relying on the name.

@@ -1,0 +1,7 @@
+{
+  "default_bars": 8,
+  "instruments": {
+    "keys": "Keys",
+    "guitar": "Guitar"
+  }
+}

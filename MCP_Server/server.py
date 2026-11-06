@@ -153,6 +153,10 @@ class AbletonConnection:
             "record_loop", "stop_record_loop", "stop_take",
             "set_metronome", "set_count_in", "create_scene",
             "keep_take", "list_takes",
+            "show_view", "arm_tracks", "take", "again", "scrap", "cancel",
+            "play_transport", "pause_transport", "nudge_tempo", "mark_playhead",
+            "label_take_lane", "delete_take_lane",
+            "stop_performance", "keep_last",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1827,6 +1831,197 @@ def keep_take(
 def list_takes(ctx: Context, track_index: int, user_prompt: str = "") -> str:
     """List clips on a track with 1-based take numbers, names, and lengths."""
     return _recording_call("list_takes", {"track_index": track_index})
+
+
+@mcp.tool()
+@telemetry_tool("get_performance_state")
+@trajectory_tool("get_performance_state", modifying=False)
+def get_performance_state(ctx: Context, user_prompt: str = "") -> str:
+    """Lightweight state for the voice trigger: view, armed tracks, recording, last take, tempo, metronome."""
+    return _recording_call("get_performance_state", {})
+
+
+@mcp.tool()
+@telemetry_tool("show_view")
+@trajectory_tool("show_view")
+def show_view(ctx: Context, view: str, user_prompt: str = "") -> str:
+    """Show and focus Session or Arrangement."""
+    return _recording_call("show_view", {"view": view})
+
+
+@mcp.tool()
+@telemetry_tool("arm_tracks")
+@trajectory_tool("arm_tracks")
+def arm_tracks(
+    ctx: Context,
+    names: List[str],
+    exclusive: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """Arm tracks by name. Exclusive disarms every other track. Monitoring becomes auto."""
+    return _recording_call("arm_tracks", {"names": names, "exclusive": exclusive})
+
+
+@mcp.tool()
+@telemetry_tool("take")
+@trajectory_tool("take")
+def take(
+    ctx: Context,
+    bars: float = 8,
+    loop: bool = False,
+    count_in: bool = True,
+    names: Optional[List[str]] = None,
+    view: Optional[str] = None,
+    user_prompt: str = "",
+) -> str:
+    """Record one take on every armed track. Default 8 bars and 1-bar count-in.
+
+    Session uses the next empty scene row. Arrangement uses the loop brace
+    from the playhead, or from the loop start when the loop is already on.
+    loop=true leaves that brace looping so Live can open a take lane per pass.
+    """
+    params = {"bars": bars, "loop": loop, "count_in": count_in}
+    if names is not None:
+        params["names"] = names
+    if view is not None:
+        params["view"] = view
+    return _recording_call("take", params)
+
+
+@mcp.tool()
+@telemetry_tool("again")
+@trajectory_tool("again")
+def again(ctx: Context, user_prompt: str = "") -> str:
+    """Delete the last take and start another with the same defaults."""
+    return _recording_call("again", {})
+
+
+@mcp.tool()
+@telemetry_tool("scrap")
+@trajectory_tool("scrap")
+def scrap(ctx: Context, user_prompt: str = "") -> str:
+    """Delete the last finished take. Does not delete a take that is still recording."""
+    return _recording_call("scrap", {})
+
+
+@mcp.tool()
+@telemetry_tool("cancel")
+@trajectory_tool("cancel")
+def cancel(ctx: Context, user_prompt: str = "") -> str:
+    """Stop transport and recording, and delete only the take that is recording now."""
+    return _recording_call("cancel", {})
+
+
+@mcp.tool()
+@telemetry_tool("play_transport")
+@trajectory_tool("play_transport")
+def play_transport(ctx: Context, user_prompt: str = "") -> str:
+    """Start or continue playback with record off. Does not delete takes."""
+    return _recording_call("play_transport", {})
+
+
+@mcp.tool()
+@telemetry_tool("pause_transport")
+@trajectory_tool("pause_transport")
+def pause_transport(ctx: Context, user_prompt: str = "") -> str:
+    """Stop the transport without deleting takes and with record off."""
+    return _recording_call("pause_transport", {})
+
+
+@mcp.tool()
+@telemetry_tool("nudge_tempo")
+@trajectory_tool("nudge_tempo")
+def nudge_tempo(ctx: Context, delta: float = 5, user_prompt: str = "") -> str:
+    """Add delta BPM to the tempo. Faster is +5, slower is -5. Clamped to 20-999."""
+    return _recording_call("nudge_tempo", {"delta": delta})
+
+
+@mcp.tool()
+@telemetry_tool("mark_playhead")
+@trajectory_tool("mark_playhead")
+def mark_playhead(ctx: Context, name: str = "", user_prompt: str = "") -> str:
+    """Add or rename a locator at the current playhead. Does not move the playhead."""
+    params = {}
+    if name:
+        params["name"] = name
+    return _recording_call("mark_playhead", params)
+
+
+@mcp.tool()
+@telemetry_tool("list_take_lanes")
+@trajectory_tool("list_take_lanes", modifying=False)
+def list_take_lanes(
+    ctx: Context,
+    track_index: Optional[int] = None,
+    name: str = "",
+    user_prompt: str = "",
+) -> str:
+    """List arrangement take lanes. Deleting or activating a lane is reported, not assumed."""
+    params = {}
+    if track_index is not None:
+        params["track_index"] = track_index
+    if name:
+        params["name"] = name
+    return _recording_call("list_take_lanes", params)
+
+
+@mcp.tool()
+@telemetry_tool("label_take_lane")
+@trajectory_tool("label_take_lane")
+def label_take_lane(
+    ctx: Context,
+    track_index: Optional[int] = None,
+    name: str = "",
+    index: Optional[int] = None,
+    label: str = "KEEP",
+    user_prompt: str = "",
+) -> str:
+    """Rename a take lane. Default is the last lane, label KEEP. Does not move clips."""
+    params = {"label": label}
+    if track_index is not None:
+        params["track_index"] = track_index
+    if name:
+        params["name"] = name
+    if index is not None:
+        params["index"] = index
+    return _recording_call("label_take_lane", params)
+
+
+@mcp.tool()
+@telemetry_tool("delete_take_lane")
+@trajectory_tool("delete_take_lane")
+def delete_take_lane(
+    ctx: Context,
+    track_index: Optional[int] = None,
+    name: str = "",
+    index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """Delete a take lane only if this Live object exposes delete. Otherwise report that it cannot."""
+    params = {}
+    if track_index is not None:
+        params["track_index"] = track_index
+    if name:
+        params["name"] = name
+    if index is not None:
+        params["index"] = index
+    return _recording_call("delete_take_lane", params)
+
+
+@mcp.tool()
+@telemetry_tool("stop_performance")
+@trajectory_tool("stop_performance")
+def stop_performance(ctx: Context, user_prompt: str = "") -> str:
+    """Stop recording and delete only the take that is being recorded. Playback stays."""
+    return _recording_call("stop_performance", {})
+
+
+@mcp.tool()
+@telemetry_tool("keep_last")
+@trajectory_tool("keep_last")
+def keep_last(ctx: Context, user_prompt: str = "") -> str:
+    """Append KEEP to the last finished take. Does not move the clip."""
+    return _recording_call("keep_last", {})
 
 
 @mcp.tool()

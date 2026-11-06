@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.9.0"
+SCRIPT_VERSION = "2.0.0"
 PROTOCOL_VERSION = 1
 
 # Live 12 Python API (not the older Max LOM wording):
@@ -65,6 +65,10 @@ _UNSETTLED_RECORD_LENGTH = 100000.0
 _LAUNCH_QUANTIZATION_NONE = 0
 # Safety ceiling when record_loop is started without max_takes.
 _RECORD_LOOP_HARD_CAP = 128
+# Voice takes. Count-in uses Song.count_in_duration when the write sticks;
+# otherwise the 1.9.0 pre-roll path runs and the reply says which one.
+DEFAULT_TAKE_BARS = 8
+DEFAULT_COUNT_IN_BARS = 1
 
 _MONITORING_STATE_BY_NAME = {"in": 0, "auto": 1, "off": 2}
 _MONITORING_NAME_BY_STATE = {0: "in", 1: "auto", 2: "off"}
@@ -105,6 +109,22 @@ RECORDING_COMMANDS = (
     "create_scene",
     "keep_take",
     "list_takes",
+    "get_performance_state",
+    "show_view",
+    "arm_tracks",
+    "take",
+    "again",
+    "scrap",
+    "cancel",
+    "play_transport",
+    "pause_transport",
+    "nudge_tempo",
+    "mark_playhead",
+    "list_take_lanes",
+    "label_take_lane",
+    "delete_take_lane",
+    "stop_performance",
+    "keep_last",
 )
 
 SCRIPT_CAPABILITIES = [
@@ -2878,6 +2898,22 @@ class AbletonMCP(ControlSurface):
             "create_scene": self._cmd_create_scene,
             "keep_take": self._cmd_keep_take,
             "list_takes": self._cmd_list_takes,
+            "get_performance_state": self._cmd_get_performance_state,
+            "show_view": self._cmd_show_view,
+            "arm_tracks": self._cmd_arm_tracks,
+            "take": self._cmd_take,
+            "again": self._cmd_again,
+            "scrap": self._cmd_scrap,
+            "cancel": self._cmd_cancel,
+            "play_transport": self._cmd_play_transport,
+            "pause_transport": self._cmd_pause_transport,
+            "nudge_tempo": self._cmd_nudge_tempo,
+            "mark_playhead": self._cmd_mark_playhead,
+            "list_take_lanes": self._cmd_list_take_lanes,
+            "label_take_lane": self._cmd_label_take_lane,
+            "delete_take_lane": self._cmd_delete_take_lane,
+            "stop_performance": self._cmd_stop_performance,
+            "keep_last": self._cmd_keep_last,
         }
 
     def _dispatch_recording_command(self, command_type, params):
@@ -5593,3 +5629,799 @@ class AbletonMCP(ControlSurface):
                 "was recording is deleted when discard_current is true."
             ),
         }
+
+    def _performance(self):
+        state = getattr(self, "_performance_state", None)
+        if state is None:
+            state = {
+                "current_take": None,
+                "last_full_take": None,
+            }
+            self._performance_state = state
+        return state
+
+    def _normalize_view_name(self, name):
+        if not isinstance(name, str):
+            raise ValueError("view must be session or arrangement")
+        key = self._fold_text(name.strip())
+        if key in ("session",):
+            return "session"
+        if key in ("arrangement", "arranger"):
+            return "arrangement"
+        raise ValueError("view must be session or arrangement")
+
+    def _shown_view(self):
+        try:
+            view = self.application().view
+            raw = getattr(view, "focused_document_view", None)
+            if raw is None and callable(getattr(view, "is_view_visible", None)):
+                if view.is_view_visible("Arranger"):
+                    return "arrangement"
+                return "session"
+            return self._normalize_view_name(raw or "Session")
+        except Exception:
+            return "session"
+
+    def _cmd_show_view(self, params):
+        self._reject_unknown(params, ("view",))
+        if "view" not in params:
+            raise ValueError("view is required")
+        target = self._normalize_view_name(params["view"])
+        live_name = "Session" if target == "session" else "Arranger"
+        app = self.application()
+        if app is None or not hasattr(app, "view"):
+            raise ValueError("Live application view is not available")
+        app.view.show_view(live_name)
+        focus = getattr(app.view, "focus_view", None)
+        if callable(focus):
+            try:
+                focus(live_name)
+            except Exception as e:
+                self.log_message("focus_view failed: " + str(e))
+        try:
+            app.view.focused_document_view = live_name
+        except Exception:
+            pass
+        return {"view": self._shown_view(), "shown": live_name}
+
+    def _match_track_name(self, name):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("track name must be a non-empty string")
+        wanted = self._fold_text(name.strip())
+        hits = []
+        for index, track in enumerate(self._iter_tracks()):
+            if self._fold_text(str(getattr(track, "name", ""))) == wanted:
+                hits.append((index, track))
+        if not hits:
+            raise ValueError("No track named %r" % name)
+        if len(hits) > 1:
+            raise ValueError("More than one track named %r" % name)
+        return hits[0]
+
+    def _cmd_arm_tracks(self, params):
+        self._reject_unknown(params, ("names", "exclusive", "monitoring"))
+        names = params.get("names")
+        if not isinstance(names, list) or not names:
+            raise ValueError("names must be a non-empty list of track names")
+        exclusive = self._optional_flag(params, "exclusive", True)
+        matched = [self._match_track_name(name) for name in names]
+        matched_indexes = set(index for index, _track in matched)
+        if exclusive:
+            for index, track in enumerate(self._iter_tracks()):
+                if index not in matched_indexes and self._safe_arm(track):
+                    if self._can_be_armed(track):
+                        track.arm = False
+        armed = []
+        for index, track in matched:
+            self._assert_can_arm(track)
+            if not self._safe_arm(track):
+                track.arm = True
+            monitoring = params.get("monitoring", None)
+            self._apply_recording_monitoring(track, monitoring)
+            armed.append({"index": index, "name": str(track.name), "arm": True})
+        return {"exclusive": exclusive, "armed_tracks": armed}
+
+    def _armed_pairs(self):
+        pairs = []
+        for index, track in enumerate(self._iter_tracks()):
+            if self._safe_arm(track):
+                pairs.append((index, track))
+        return pairs
+
+    def _cmd_get_performance_state(self, params):
+        self._reject_unknown(params, ())
+        perf = self._performance()
+        recording_slots = []
+        for index, track in enumerate(self._iter_tracks()):
+            for clip_index in self._recording_slot_indexes(track):
+                recording_slots.append({
+                    "track_index": index,
+                    "clip_index": clip_index,
+                })
+        return {
+            "view": self._shown_view(),
+            "armed_tracks": [
+                {"index": index, "name": str(track.name)}
+                for index, track in self._armed_pairs()
+            ],
+            "recording": bool(recording_slots) or self._read_song_bool("record_mode"),
+            "recording_slots": recording_slots,
+            "record_mode": self._optional_song_value("record_mode", bool, None),
+            "tempo": self._optional_song_value("tempo", float, None),
+            "metronome": self._optional_song_value("metronome", bool, None),
+            "is_playing": self._optional_song_value("is_playing", bool, None),
+            "current_song_time": self._optional_song_value("current_song_time", float, None),
+            "loop": self._optional_song_value("loop", bool, None),
+            "last_take": perf.get("last_full_take"),
+            "current_take": perf.get("current_take"),
+        }
+
+    def _engage_count_in(self, bars):
+        mapping = {0: 0, 1: 1, 2: 2, 4: 3}
+        index = mapping.get(int(bars), 1)
+        try:
+            self._song.count_in_duration = index
+            readback = self._optional_song_value("count_in_duration", int, None)
+            if readback == index:
+                try:
+                    self._song.metronome = True
+                except Exception:
+                    pass
+                return {
+                    "path": "count_in_duration",
+                    "bars": int(bars),
+                    "count_in_writable": True,
+                }
+            error = "write did not stick"
+        except Exception as e:
+            error = str(e)
+        return {
+            "path": "pre_roll",
+            "bars": int(bars),
+            "count_in_writable": False,
+            "error": error,
+        }
+
+    def _common_empty_slot(self, pairs):
+        if not pairs:
+            return None
+        try:
+            limit = min(len(list(track.clip_slots)) for _index, track in pairs)
+        except Exception:
+            return None
+        for slot_index in range(limit):
+            empty = True
+            for _index, track in pairs:
+                slot = self._slot_at(track, slot_index)
+                if bool(getattr(slot, "has_clip", False)) or self._slot_is_recording(slot):
+                    empty = False
+                    break
+            if empty:
+                return slot_index
+        return None
+
+    def _remember_take(self, take):
+        perf = self._performance()
+        perf["current_take"] = take
+        return take
+
+    def _mark_take_full_later(self, take):
+        def poll():
+            if take.get("cancelled"):
+                return
+            still = False
+            for item in take.get("slots") or []:
+                track = self._track_at(item["track_index"])
+                slot = self._slot_at(track, item["clip_index"])
+                if self._slot_is_recording(slot):
+                    still = True
+                    break
+            if take.get("view") == "arrangement" and self._read_song_bool("record_mode"):
+                if not take.get("loop"):
+                    try:
+                        now = float(self._song.current_song_time)
+                    except Exception:
+                        now = 0.0
+                    if now + 1e-3 < float(take.get("end_time") or 0.0):
+                        still = True
+                    else:
+                        self._assign_song_bool("record_mode", False)
+            if still:
+                self._schedule_later(1, poll)
+                return
+            take["full"] = True
+            take["recording"] = False
+            self._performance()["last_full_take"] = take
+            if self._performance().get("current_take") is take:
+                self._performance()["current_take"] = None
+        self._schedule_later(1, poll)
+
+    def _start_session_take(self, pairs, beats, bars, count_in, loop):
+        slot_index = self._common_empty_slot(pairs)
+        created_scene = False
+        if slot_index is None:
+            self._append_scene_and_slot(pairs[0][1])
+            slot_index = self._common_empty_slot(pairs)
+            created_scene = True
+            if slot_index is None:
+                raise ValueError("Could not find an empty scene row. Nothing was fired.")
+        take = {
+            "view": "session",
+            "bars": bars,
+            "beats": beats,
+            "loop": False,
+            "slots": [
+                {"track_index": index, "clip_index": slot_index, "name": str(track.name)}
+                for index, track in pairs
+            ],
+            "recording": True,
+            "full": False,
+            "count_in": count_in,
+            "created_scene": created_scene,
+        }
+
+        def fire_all():
+            for index, track in pairs:
+                slot = self._slot_at(track, slot_index)
+                if bool(getattr(slot, "has_clip", False)) or self._slot_is_recording(slot):
+                    continue
+                self._fire_empty_slot(track, index, slot, slot_index, beats, True)
+            self._mark_take_full_later(take)
+
+        if count_in and count_in.get("path") == "pre_roll":
+            target = self._begin_pre_roll(count_in["bars"])
+            holder = {"tries": 0}
+
+            def wait():
+                holder["tries"] += 1
+                if holder["tries"] > 400:
+                    return
+                try:
+                    now = float(self._song.current_song_time)
+                except Exception:
+                    now = 0.0
+                if now + 1e-4 < target:
+                    self._schedule_later(1, wait)
+                    return
+                fire_all()
+
+            self._schedule_later(1, wait)
+            take["recording"] = False
+            take["scheduled"] = True
+        else:
+            fire_all()
+            take["scheduled"] = False
+        self._remember_take(take)
+        return {
+            "take": take,
+            "slot_index": slot_index,
+            "count_in": count_in,
+            "deleted": False,
+            "note": (
+                "Session take uses one empty scene row on every armed track. "
+                "Fixed length is exact for this fire only. Count-in path is "
+                "in count_in.path."
+            ),
+        }
+
+    def _start_arrangement_take(self, pairs, beats, bars, count_in, loop):
+        try:
+            if bool(self._song.loop):
+                start = float(self._song.loop_start)
+            else:
+                start = float(self._song.current_song_time)
+        except Exception:
+            start = 0.0
+        end = start + float(beats)
+        try:
+            self._song.loop_start = start
+            self._song.loop_length = float(beats)
+        except Exception as e:
+            raise ValueError("Could not set the arrangement loop brace (%s)" % e)
+        if loop:
+            self._assign_song_bool("loop", True)
+            try:
+                self._song.punch_in = False
+                self._song.punch_out = False
+            except Exception:
+                pass
+        else:
+            self._assign_song_bool("loop", False)
+            try:
+                self._song.punch_in = True
+                self._song.punch_out = True
+            except Exception as e:
+                self.log_message("punch in/out unavailable: " + str(e))
+        take = {
+            "view": "arrangement",
+            "bars": bars,
+            "beats": beats,
+            "loop": bool(loop),
+            "start_time": start,
+            "end_time": end,
+            "tracks": [
+                {"track_index": index, "name": str(track.name)}
+                for index, track in pairs
+            ],
+            "recording": True,
+            "full": False,
+            "count_in": count_in,
+            "take_lanes": self._lanes_for_pairs(pairs),
+            "lane_note": self._take_lane_support_note(),
+        }
+
+        def roll():
+            self._assign_song_bool("record_mode", True)
+            if callable(getattr(self._song, "start_playing", None)):
+                if not self._read_song_bool("is_playing"):
+                    self._song.start_playing()
+            self._mark_take_full_later(take)
+
+        if count_in and count_in.get("path") == "pre_roll":
+            target = self._begin_pre_roll(count_in["bars"])
+            holder = {"tries": 0}
+
+            def wait():
+                holder["tries"] += 1
+                if holder["tries"] > 400:
+                    return
+                try:
+                    now = float(self._song.current_song_time)
+                except Exception:
+                    now = 0.0
+                if now + 1e-4 < target:
+                    self._schedule_later(1, wait)
+                    return
+                roll()
+
+            self._schedule_later(1, wait)
+            take["scheduled"] = True
+            take["recording"] = False
+        else:
+            roll()
+            take["scheduled"] = False
+        self._remember_take(take)
+        return {
+            "take": take,
+            "count_in": count_in,
+            "deleted": False,
+            "note": (
+                "Arrangement take sets the loop brace to this length. "
+                "Loop mode leaves the brace looping so Live can open a new "
+                "take lane on each pass when comping is enabled in Live. "
+                "A one-shot uses punch-in and punch-out on that brace. "
+                "The LOM cannot activate or delete a take lane; see take_lanes."
+            ),
+        }
+
+    def _cmd_take(self, params):
+        self._reject_unknown(params, (
+            "bars", "loop", "count_in", "names", "exclusive", "view",
+        ))
+        bars = DEFAULT_TAKE_BARS
+        if "bars" in params and params["bars"] is not None:
+            bars = params["bars"]
+        beats, _numer = self._bars_to_beats(bars)
+        loop = self._optional_flag(params, "loop", False)
+        count_flag = True
+        if "count_in" in params and params["count_in"] is not None:
+            count_flag = self._require_bool(params["count_in"], "count_in")
+        if "names" in params:
+            self._cmd_arm_tracks({
+                "names": params["names"],
+                "exclusive": params.get("exclusive", True),
+            })
+        if "view" in params and params["view"] is not None:
+            view = self._normalize_view_name(params["view"])
+            self._cmd_show_view({"view": view})
+        else:
+            view = self._shown_view()
+        pairs = self._armed_pairs()
+        if not pairs:
+            raise ValueError("No armed tracks. Nothing was recorded.")
+        count_in = self._engage_count_in(DEFAULT_COUNT_IN_BARS) if count_flag else {
+            "path": "off", "bars": 0, "count_in_writable": None,
+        }
+        if view == "arrangement":
+            result = self._start_arrangement_take(pairs, beats, bars, count_in, loop)
+        else:
+            result = self._start_session_take(pairs, beats, bars, count_in, loop)
+        result["view"] = view
+        result["bars"] = bars
+        result["beats"] = beats
+        return result
+
+    def _delete_session_slots(self, slots, only_recording):
+        deleted = []
+        for item in slots or []:
+            track = self._track_at(item["track_index"])
+            slot = self._slot_at(track, item["clip_index"])
+            recording = self._slot_is_recording(slot)
+            if only_recording and not recording:
+                continue
+            if not only_recording and recording:
+                continue
+            if not bool(getattr(slot, "has_clip", False)) and not recording:
+                continue
+            name = ""
+            try:
+                if bool(getattr(slot, "has_clip", False)):
+                    name = str(slot.clip.name)
+            except Exception:
+                name = ""
+            if recording and callable(getattr(slot, "stop", None)):
+                try:
+                    slot.stop()
+                except Exception:
+                    pass
+            if bool(getattr(slot, "has_clip", False)) and callable(getattr(slot, "delete_clip", None)):
+                slot.delete_clip()
+            deleted.append({
+                "track_index": item["track_index"],
+                "clip_index": item["clip_index"],
+                "name": name,
+            })
+        return deleted
+
+    def _cmd_again(self, params):
+        self._reject_unknown(params, ())
+        perf = self._performance()
+        current = perf.get("current_take")
+        deleted = []
+        if current and current.get("view") == "session":
+            deleted = self._delete_session_slots(current.get("slots"), only_recording=False)
+            current["cancelled"] = True
+        elif current and current.get("recording"):
+            self._assign_song_bool("record_mode", False)
+            current["cancelled"] = True
+        elif perf.get("last_full_take"):
+            full = perf["last_full_take"]
+            if full.get("view") == "session":
+                deleted = self._delete_session_slots(full.get("slots"), only_recording=False)
+            full["cancelled"] = True
+            perf["last_full_take"] = None
+        perf["current_take"] = None
+        started = self._cmd_take({})
+        started["deleted_previous"] = deleted
+        return started
+
+    def _cmd_scrap(self, params):
+        self._reject_unknown(params, ())
+        perf = self._performance()
+        full = perf.get("last_full_take")
+        if not full:
+            return {
+                "deleted": False,
+                "note": "No finished take to scrap. The take that is still recording is left for cancel.",
+            }
+        deleted = []
+        if full.get("view") == "session":
+            deleted = self._delete_session_slots(full.get("slots"), only_recording=False)
+        full["cancelled"] = True
+        perf["last_full_take"] = None
+        return {"deleted": bool(deleted), "clips": deleted, "moved": False}
+
+    def _cmd_cancel(self, params):
+        self._reject_unknown(params, ())
+        perf = self._performance()
+        current = perf.get("current_take")
+        if current:
+            current["cancelled"] = True
+        discarded = []
+        for index, track in enumerate(self._iter_tracks()):
+            for item in self._discard_recording_on_track(track):
+                item["track_index"] = index
+                discarded.append(item)
+        self._assign_song_bool("record_mode", False)
+        self._assign_song_bool("session_record", False)
+        try:
+            self._song.punch_in = False
+            self._song.punch_out = False
+        except Exception:
+            pass
+        if callable(getattr(self._song, "stop_playing", None)):
+            self._song.stop_playing()
+        for state in list(self._record_loops().values()):
+            state["stopped"] = True
+        self._record_loops().clear()
+        perf["current_take"] = None
+        return {
+            "deleted": bool(discarded),
+            "discarded": discarded,
+            "playing": False,
+            "record_mode": False,
+            "finished_takes_kept": True,
+            "moved": False,
+        }
+
+    def _cmd_play_transport(self, params):
+        self._reject_unknown(params, ())
+        self._assign_song_bool("record_mode", False)
+        self._assign_song_bool("session_record", False)
+        if callable(getattr(self._song, "continue_playing", None)):
+            self._song.continue_playing()
+        elif callable(getattr(self._song, "start_playing", None)):
+            self._song.start_playing()
+        else:
+            raise ValueError("Song cannot start playback")
+        return {
+            "playing": True,
+            "record_mode": False,
+            "deleted": False,
+            "note": "Transport play without recording. Requested state, not a same-tick read.",
+        }
+
+    def _cmd_pause_transport(self, params):
+        self._reject_unknown(params, ())
+        self._assign_song_bool("record_mode", False)
+        if callable(getattr(self._song, "stop_playing", None)):
+            self._song.stop_playing()
+        return {
+            "playing": False,
+            "record_mode": False,
+            "deleted": False,
+            "note": "Transport pause without deleting takes. Requested state.",
+        }
+
+    def _cmd_nudge_tempo(self, params):
+        self._reject_unknown(params, ("delta",))
+        delta = 5.0
+        if "delta" in params and params["delta"] is not None:
+            delta = self._finite_float(params["delta"], "delta")
+        current = float(self._song.tempo)
+        updated = current + delta
+        if updated < 20.0:
+            updated = 20.0
+        if updated > 999.0:
+            updated = 999.0
+        self._song.tempo = updated
+        return {"tempo": float(self._song.tempo), "previous": current, "delta": delta}
+
+    def _cmd_mark_playhead(self, params):
+        self._reject_unknown(params, ("name",))
+        name = params.get("name") or ""
+        if name and not isinstance(name, str):
+            raise ValueError("name must be a string")
+        song = self._song
+        if not callable(getattr(song, "set_or_delete_cue", None)):
+            raise ValueError("This Live song cannot create a locator")
+        target = float(song.current_song_time)
+        existing = None
+        for cue in list(getattr(song, "cue_points", []) or []):
+            try:
+                if abs(float(cue.time) - target) < 1e-3:
+                    existing = cue
+                    break
+            except Exception:
+                continue
+        if existing is None:
+            song.set_or_delete_cue()
+            for cue in list(getattr(song, "cue_points", []) or []):
+                try:
+                    if abs(float(cue.time) - target) < 1e-3:
+                        existing = cue
+                        break
+                except Exception:
+                    continue
+        if existing is None:
+            raise ValueError("Locator was not created at the playhead")
+        if name:
+            try:
+                existing.name = name
+            except Exception as e:
+                self.log_message("locator rename failed: " + str(e))
+        return {
+            "time": float(existing.time),
+            "name": str(getattr(existing, "name", "")),
+            "moved_playhead": False,
+        }
+
+    def _take_lane_support_note(self):
+        return (
+            "Live 12.4.5 TakeLane can be listed and renamed. "
+            "It exposes arrangement_clips, name, create_audio_clip, and "
+            "create_midi_clip. Track.create_take_lane exists. "
+            "No member activates a lane or deletes one. "
+            "Per-pass lanes during a looping arrangement record are Live's "
+            "comping behavior, not a call this script can make."
+        )
+
+    def _lanes_for_pairs(self, pairs):
+        listed = []
+        for index, track in pairs:
+            lanes = self._read_take_lanes(track)
+            listed.append({
+                "track_index": index,
+                "name": str(getattr(track, "name", "")),
+                "take_lanes": lanes,
+                "delete_supported": self._take_lane_delete_callable(track, lanes)[0],
+                "activate_supported": False,
+            })
+        return listed
+
+    def _read_take_lanes(self, track):
+        raw = getattr(track, "take_lanes", None)
+        if raw is None:
+            return None
+        lanes = []
+        try:
+            sequence = list(raw)
+        except Exception as e:
+            return [{"error": str(e)}]
+        for index, lane in enumerate(sequence):
+            clips = []
+            try:
+                for clip in list(getattr(lane, "arrangement_clips", []) or []):
+                    clips.append({
+                        "name": str(getattr(clip, "name", "")),
+                        "start_time": float(getattr(clip, "start_time", 0.0)),
+                        "length": float(getattr(clip, "length", 0.0)),
+                        "is_recording": bool(getattr(clip, "is_recording", False)),
+                    })
+            except Exception as e:
+                clips.append({"error": str(e)})
+            lanes.append({
+                "index": index,
+                "name": str(getattr(lane, "name", "")),
+                "clips": clips,
+            })
+        return lanes
+
+    def _take_lane_delete_callable(self, track, lanes):
+        if callable(getattr(track, "delete_take_lane", None)):
+            return True, "track.delete_take_lane"
+        if lanes:
+            return False, None
+        return False, None
+
+    def _track_from_name_or_index(self, params):
+        if "track_index" in params and params["track_index"] is not None:
+            index = self._require_int(params["track_index"], "track_index")
+            return index, self._track_at(index)
+        if "name" in params and params["name"]:
+            return self._match_track_name(params["name"])
+        raise ValueError("track_index or name is required")
+
+    def _cmd_list_take_lanes(self, params):
+        self._reject_unknown(params, ("track_index", "name"))
+        index, track = self._track_from_name_or_index(params)
+        lanes = self._read_take_lanes(track)
+        supported = lanes is not None
+        delete_supported, _how = self._take_lane_delete_callable(track, lanes or [])
+        return {
+            "track_index": index,
+            "name": str(getattr(track, "name", "")),
+            "supported": supported,
+            "take_lanes": lanes if lanes is not None else [],
+            "delete_supported": delete_supported,
+            "activate_supported": False,
+            "note": self._take_lane_support_note(),
+        }
+
+    def _cmd_label_take_lane(self, params):
+        self._reject_unknown(params, ("track_index", "name", "index", "label"))
+        index, track = self._track_from_name_or_index(params)
+        raw = getattr(track, "take_lanes", None)
+        if raw is None:
+            return {
+                "supported": False,
+                "note": self._take_lane_support_note(),
+            }
+        lanes = list(raw)
+        if not lanes:
+            raise ValueError("Track has no take lanes. Nothing was renamed.")
+        lane_index = len(lanes) - 1
+        if "index" in params and params["index"] is not None:
+            lane_index = self._require_int(params["index"], "index")
+        if lane_index < 0 or lane_index >= len(lanes):
+            raise ValueError("Take lane index out of range")
+        lane = lanes[lane_index]
+        label = params.get("label") or "KEEP"
+        if not isinstance(label, str):
+            raise ValueError("label must be a string")
+        current = str(getattr(lane, "name", "") or "")
+        if label == "KEEP" and not current.rstrip().endswith("KEEP"):
+            lane.name = (current + " KEEP").strip() if current else "KEEP"
+        elif label != "KEEP":
+            lane.name = label
+        return {
+            "track_index": index,
+            "index": lane_index,
+            "name": str(lane.name),
+            "moved": False,
+            "activate_supported": False,
+        }
+
+    def _cmd_delete_take_lane(self, params):
+        self._reject_unknown(params, ("track_index", "name", "index"))
+        index, track = self._track_from_name_or_index(params)
+        raw = getattr(track, "take_lanes", None)
+        if raw is None:
+            return {"delete_supported": False, "deleted": False, "note": self._take_lane_support_note()}
+        lanes = list(raw)
+        if not lanes:
+            return {"delete_supported": False, "deleted": False, "note": "No take lanes."}
+        lane_index = len(lanes) - 1
+        if "index" in params and params["index"] is not None:
+            lane_index = self._require_int(params["index"], "index")
+        deleter = getattr(track, "delete_take_lane", None)
+        if callable(deleter):
+            deleter(lane_index)
+            return {"delete_supported": True, "deleted": True, "index": lane_index, "how": "track.delete_take_lane"}
+        lane = lanes[lane_index]
+        lane_delete = getattr(lane, "delete", None)
+        if callable(lane_delete):
+            lane_delete()
+            return {"delete_supported": True, "deleted": True, "index": lane_index, "how": "lane.delete"}
+        return {
+            "delete_supported": False,
+            "deleted": False,
+            "index": lane_index,
+            "note": self._take_lane_support_note(),
+        }
+
+    def _cmd_stop_performance(self, params):
+        """Stop recording and delete only the clip that is being recorded."""
+        self._reject_unknown(params, ())
+        self._assign_song_bool("record_mode", False)
+        self._assign_song_bool("session_record", False)
+        discarded = []
+        for index, track in enumerate(self._iter_tracks()):
+            for item in self._discard_recording_on_track(track):
+                item["track_index"] = index
+                discarded.append(item)
+        current = self._performance().get("current_take")
+        if current:
+            current["cancelled"] = True
+            self._performance()["current_take"] = None
+        return {
+            "record_mode": False,
+            "discarded": discarded,
+            "deleted": bool(discarded),
+            "playing": self._optional_song_value("is_playing", bool, None),
+            "finished_takes_kept": True,
+            "moved": False,
+        }
+
+    def _cmd_keep_last(self, params):
+        """Append KEEP to the last finished take. Does not move clips."""
+        self._reject_unknown(params, ())
+        perf = self._performance()
+        take = perf.get("last_full_take") or perf.get("current_take")
+        labeled = []
+        if take and take.get("view") == "session":
+            for item in take.get("slots") or []:
+                track = self._track_at(item["track_index"])
+                slot = self._slot_at(track, item["clip_index"])
+                if self._slot_is_recording(slot) or not bool(getattr(slot, "has_clip", False)):
+                    continue
+                clip = slot.clip
+                name = str(getattr(clip, "name", "") or "")
+                if not name.rstrip().endswith("KEEP"):
+                    clip.name = (name + " KEEP").strip() if name else "KEEP"
+                labeled.append({
+                    "track_index": item["track_index"],
+                    "clip_index": item["clip_index"],
+                    "name": str(clip.name),
+                })
+        if not labeled:
+            pairs = self._armed_pairs() or list(enumerate(self._iter_tracks()))[:1]
+            for index, track in pairs:
+                takes = self._take_slots(track)
+                if not takes:
+                    continue
+                last = takes[-1]
+                if last["is_recording"]:
+                    continue
+                slot = self._slot_at(track, last["clip_index"])
+                clip = slot.clip
+                name = str(getattr(clip, "name", "") or "")
+                if not name.rstrip().endswith("KEEP"):
+                    clip.name = (name + " KEEP").strip() if name else "KEEP"
+                labeled.append({
+                    "track_index": index,
+                    "clip_index": last["clip_index"],
+                    "name": str(clip.name),
+                })
+                break
+        return {"labeled": labeled, "moved": False}
